@@ -862,7 +862,8 @@ const server = http.createServer((req, res) => {
   }
   if (req.url.startsWith('/api/session-messages?')) {
     const params = new URL(req.url, 'http://localhost').searchParams;
-    const sessionId = params.get('id') || '';
+    const rawId = params.get('id') || '';
+    const sessionId = rawId.replace(/[^a-zA-Z0-9\-_:.]/g, '');
     const messages = [];
     try {
       const files = fs.readdirSync(sessDir).filter(f => f.endsWith('.jsonl'));
@@ -958,48 +959,17 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ avgSeconds: getAvgResponseTime() }));
     return;
   }
-  if (req.url === '/api/activity-heatmap') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    try {
-      const thirtyDaysAgo = Date.now() - 30 * 86400000;
-      const files = fs.readdirSync(sessDir).filter(f => {
-        if (!f.endsWith('.jsonl')) return false;
-        try { return fs.statSync(path.join(sessDir, f)).mtimeMs > thirtyDaysAgo; } catch { return false; }
-      });
-      const heatmap = {};
-      for (let d = 0; d < 7; d++) {
-        for (let h = 0; h < 24; h++) {
-          heatmap[`${d}-${h}`] = 0;
-        }
-      }
-      for (const file of files) {
-        const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const d = JSON.parse(line);
-            if (d.type !== 'message') continue;
-            const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
-            if (ts < thirtyDaysAgo) continue;
-            const date = new Date(ts);
-            const dow = date.getDay();
-            const hour = date.getHours();
-            const key = `${dow}-${hour}`;
-            heatmap[key] = (heatmap[key] || 0) + 1;
-          } catch {}
-        }
-      }
-      res.end(JSON.stringify(heatmap));
-    } catch (e) {
-      res.end(JSON.stringify({}));
-    }
-    return;
-  }
   if (req.url.startsWith('/api/logs?')) {
     try {
       const params = new URL(req.url, 'http://localhost').searchParams;
+      const allowedServices = ['openclaw', 'agent-dashboard', 'tailscaled', 'sshd', 'nginx'];
       const service = params.get('service') || 'openclaw';
-      const lines = parseInt(params.get('lines')) || 100;
+      if (!allowedServices.includes(service)) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Invalid service name');
+        return;
+      }
+      const lines = Math.min(Math.max(parseInt(params.get('lines')) || 100, 1), 1000);
       const { execSync } = require('child_process');
       const logs = execSync(`journalctl -u ${service} --no-pager -n ${lines} -o short 2>/dev/null || echo "No logs available"`, { encoding: 'utf8', timeout: 10000 });
       res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -1205,7 +1175,7 @@ const server = http.createServer((req, res) => {
       let fpath = '';
       if (fname === 'MEMORY.md') fpath = memoryMdPath;
       else if (fname === 'HEARTBEAT.md') fpath = heartbeatPath;
-      else if (fname.startsWith('memory/')) fpath = path.join(WORKSPACE_DIR, fname);
+      else if (fname.startsWith('memory/') && !fname.includes('..')) fpath = path.join(WORKSPACE_DIR, fname);
       else throw new Error('Invalid path');
       
       if (fs.existsSync(fpath)) {
@@ -1226,7 +1196,8 @@ const server = http.createServer((req, res) => {
     try {
       const parts = req.url.split('/');
       const action = parts[parts.length - 1];
-      const id = parts[parts.length - 2];
+      const id = parts[parts.length - 2].replace(/[^a-zA-Z0-9\-_]/g, '');
+      if (!id) { res.writeHead(400); res.end('Invalid id'); return; }
       
       if (action === 'toggle') {
         const { execSync } = require('child_process');
