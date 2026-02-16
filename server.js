@@ -17,6 +17,7 @@ const memoryMdPath = path.join(WORKSPACE_DIR, 'MEMORY.md');
 const heartbeatPath = path.join(WORKSPACE_DIR, 'HEARTBEAT.md');
 const healthHistoryFile = path.join(dataDir, 'health-history.json');
 const auditLogPath = '/root/clawd/data/audit.log';
+const mfaSecretFile = '/root/clawd/data/mfa-secret.txt';
 
 const skillsDir = path.join(WORKSPACE_DIR, 'skills');
 const configFiles = [
@@ -47,8 +48,76 @@ if (!DASHBOARD_TOKEN) {
   console.log('');
 }
 
+let MFA_SECRET = process.env.DASHBOARD_MFA_SECRET;
+if (!MFA_SECRET && fs.existsSync(mfaSecretFile)) {
+  try {
+    MFA_SECRET = fs.readFileSync(mfaSecretFile, 'utf8').trim();
+  } catch {}
+}
+
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function base32Decode(input) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const char of input.toUpperCase().replace(/=+$/, '')) {
+    const val = alphabet.indexOf(char);
+    if (val === -1) continue;
+    bits += val.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.substring(i, i + 8), 2));
+  }
+  return Buffer.from(bytes);
+}
+
+function base32Encode(buffer) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const byte of buffer) {
+    bits += byte.toString(2).padStart(8, '0');
+  }
+  let result = '';
+  for (let i = 0; i < bits.length; i += 5) {
+    const chunk = bits.substring(i, i + 5).padEnd(5, '0');
+    result += alphabet[parseInt(chunk, 2)];
+  }
+  return result;
+}
+
+function generateTOTP(secret, timeStep = 30, digits = 6, window = 0) {
+  const epoch = Math.floor(Date.now() / 1000);
+  const counter = Math.floor(epoch / timeStep) + window;
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
+  counterBuffer.writeUInt32BE(counter & 0xFFFFFFFF, 4);
+  
+  const decodedSecret = base32Decode(secret);
+  const hmac = crypto.createHmac('sha1', decodedSecret);
+  hmac.update(counterBuffer);
+  const hash = hmac.digest();
+  
+  const offset = hash[hash.length - 1] & 0x0f;
+  const binary = ((hash[offset] & 0x7f) << 24) | ((hash[offset + 1] & 0xff) << 16) | ((hash[offset + 2] & 0xff) << 8) | (hash[offset + 3] & 0xff);
+  const otp = binary % (10 ** digits);
+  return otp.toString().padStart(digits, '0');
+}
+
+function verifyTOTP(secret, code) {
+  for (let w = -1; w <= 1; w++) {
+    if (generateTOTP(secret, 30, 6, w) === code) return true;
+  }
+  return false;
+}
+
 const rateLimitStore = new Map();
-const loginAttempts = new Map();
 const MAX_FILE_BODY = 1024 * 1024;
 const READ_ONLY_FILES = new Set(['openclaw-gateway.service', 'openclaw-config.json']);
 
@@ -61,7 +130,9 @@ function auditLog(event, ip, details = {}) {
     if (stats.size > 10 * 1024 * 1024) {
       const lines = fs.readFileSync(auditLogPath, 'utf8').split('\n');
       const keep = lines.slice(-5000).join('\n');
-      fs.writeFileSync(auditLogPath, keep, 'utf8');
+      const tmpPath = auditLogPath + '.tmp';
+      fs.writeFileSync(tmpPath, keep, 'utf8');
+      fs.renameSync(tmpPath, auditLogPath);
     }
   } catch {}
 }
@@ -70,8 +141,11 @@ function setSecurityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com");
+  // unsafe-inline is required because the dashboard uses a single-file architecture (index.html with inline scripts).
+  // If the architecture changes to separate JS files, remove 'unsafe-inline' from both script-src and default-src.
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com");
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 }
 
 function setSameSiteCORS(req, res) {
@@ -80,20 +154,27 @@ function setSameSiteCORS(req, res) {
   if (origin && origin.includes(host)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else if (!origin) {
-    res.setHeader('Access-Control-Allow-Origin', `http://${host}`);
+    const proto = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    res.setHeader('Access-Control-Allow-Origin', `${proto}://${host}`);
   }
 }
 
 function checkRateLimit(ip) {
   const now = Date.now();
-  const failedAttempts = rateLimitStore.get(ip) || [];
-  const recentFails = failedAttempts.filter(t => now - t < 15 * 60 * 1000);
-  if (recentFails.length >= 20) {
-    const oldestFail = recentFails[0];
-    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - oldestFail)) / 1000);
-    return { blocked: true, remainingSeconds: lockoutRemaining };
+  const attempts = rateLimitStore.get(ip) || [];
+  const recent = attempts.filter(t => now - t < 15 * 60 * 1000);
+  rateLimitStore.set(ip, recent);
+  if (recent.length >= 20) {
+    const lastAttempt = recent[recent.length - 1];
+    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - lastAttempt)) / 1000);
+    return { blocked: true, softLocked: true, remainingSeconds: lockoutRemaining };
   }
-  return { blocked: false };
+  if (recent.length >= 5) {
+    const lastAttempt = recent[recent.length - 1];
+    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - lastAttempt)) / 1000);
+    return { blocked: false, softLocked: true, remainingSeconds: lockoutRemaining };
+  }
+  return { blocked: false, softLocked: false };
 }
 
 function recordFailedAuth(ip) {
@@ -103,45 +184,24 @@ function recordFailedAuth(ip) {
   rateLimitStore.set(ip, attempts);
 }
 
-function checkLoginLockout(ip) {
-  const now = Date.now();
-  const attempts = loginAttempts.get(ip) || [];
-  const recentAttempts = attempts.filter(t => now - t < 15 * 60 * 1000);
-  if (recentAttempts.length >= 5) {
-    const oldestAttempt = recentAttempts[0];
-    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - oldestAttempt)) / 1000);
-    return { locked: true, remainingSeconds: lockoutRemaining };
-  }
-  return { locked: false };
-}
-
-function recordLoginAttempt(ip) {
-  const now = Date.now();
-  const attempts = loginAttempts.get(ip) || [];
-  attempts.push(now);
-  loginAttempts.set(ip, attempts);
-}
-
-function clearLoginAttempts(ip) {
-  loginAttempts.delete(ip);
+function clearFailedAuth(ip) {
+  rateLimitStore.delete(ip);
 }
 
 function getClientIP(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
-         req.headers['x-real-ip'] || 
-         req.socket.remoteAddress || 
-         'unknown';
+  return req.socket.remoteAddress || 'unknown';
 }
 
 function isAuthenticated(req) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.substring(7);
-    return token === DASHBOARD_TOKEN;
+    return safeCompare(token, DASHBOARD_TOKEN);
   }
   const url = new URL(req.url, 'http://localhost');
   const tokenParam = url.searchParams.get('token');
-  return tokenParam === DASHBOARD_TOKEN;
+  if (!tokenParam) return false;
+  return safeCompare(tokenParam, DASHBOARD_TOKEN);
 }
 
 function requireAuth(req, res) {
@@ -156,7 +216,8 @@ function requireAuth(req, res) {
   
   if (!isAuthenticated(req)) {
     recordFailedAuth(ip);
-    auditLog('auth_failed', ip, { url: req.url });
+    const sanitizedUrl = req.url.replace(/token=[^&]+/g, 'token=REDACTED');
+    auditLog('auth_failed', ip, { url: sanitizedUrl });
     setSecurityHeaders(res);
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Unauthorized' }));
@@ -1137,6 +1198,16 @@ const server = http.createServer((req, res) => {
   setSecurityHeaders(res);
   const ip = getClientIP(req);
 
+  if (req.method === 'OPTIONS') {
+    setSameSiteCORS(req, res);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (req.url === '/api/auth/verify') {
     if (isAuthenticated(req)) {
       setSameSiteCORS(req, res);
@@ -1153,11 +1224,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url === '/api/auth/login' && req.method === 'POST') {
-    const lockout = checkLoginLockout(ip);
-    if (lockout.locked) {
-      auditLog('login_locked', ip, { remainingSeconds: lockout.remainingSeconds });
+    const limitCheck = checkRateLimit(ip);
+    if (limitCheck.softLocked) {
+      auditLog('login_locked', ip, { remainingSeconds: limitCheck.remainingSeconds, hardLocked: limitCheck.blocked });
       res.writeHead(429, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Too many failed login attempts', lockoutRemaining: lockout.remainingSeconds }));
+      res.end(JSON.stringify({ error: 'Too many failed login attempts', lockoutRemaining: limitCheck.remainingSeconds }));
       return;
     }
 
@@ -1165,19 +1236,105 @@ const server = http.createServer((req, res) => {
     req.on('data', chunk => { body += chunk; if (body.length > 1024) req.destroy(); });
     req.on('end', () => {
       try {
-        const { token } = JSON.parse(body);
-        if (token === DASHBOARD_TOKEN) {
-          clearLoginAttempts(ip);
-          auditLog('login_success', ip);
-          setSameSiteCORS(req, res);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, token: DASHBOARD_TOKEN }));
-        } else {
-          recordLoginAttempt(ip);
+        const { token, totpCode } = JSON.parse(body);
+        if (!safeCompare(token, DASHBOARD_TOKEN)) {
+          recordFailedAuth(ip);
           auditLog('login_failed', ip);
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Invalid token' }));
+          return;
         }
+        
+        if (MFA_SECRET) {
+          if (!totpCode) {
+            setSameSiteCORS(req, res);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ requiresMfa: true }));
+            return;
+          }
+          
+          if (!verifyTOTP(MFA_SECRET, totpCode)) {
+            recordFailedAuth(ip);
+            auditLog('login_mfa_failed', ip);
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid TOTP code' }));
+            return;
+          }
+        }
+        
+        clearFailedAuth(ip);
+        auditLog('login_success', ip);
+        setSameSiteCORS(req, res);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Bad request' }));
+      }
+    });
+    return;
+  }
+
+  if (req.url === '/api/auth/mfa-status') {
+    if (!requireAuth(req, res)) return;
+    setSameSiteCORS(req, res);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ enabled: !!MFA_SECRET }));
+    return;
+  }
+
+  if (req.url === '/api/auth/setup-mfa' && req.method === 'POST') {
+    if (!requireAuth(req, res)) return;
+    setSameSiteCORS(req, res);
+    
+    try {
+      const secret = base32Encode(crypto.randomBytes(20));
+      const otpauth_uri = `otpauth://totp/OpenClaw%20Dashboard?secret=${secret}&issuer=OpenClaw`;
+      
+      fs.writeFileSync(mfaSecretFile, secret, 'utf8');
+      MFA_SECRET = secret;
+      
+      auditLog('mfa_setup', getClientIP(req));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ secret, otpauth_uri }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (req.url === '/api/auth/disable-mfa' && req.method === 'POST') {
+    if (!requireAuth(req, res)) return;
+    setSameSiteCORS(req, res);
+    
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 1024) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const { totpCode } = JSON.parse(body);
+        
+        if (!MFA_SECRET) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'MFA is not enabled' }));
+          return;
+        }
+        
+        if (!totpCode || !verifyTOTP(MFA_SECRET, totpCode)) {
+          auditLog('mfa_disable_failed', getClientIP(req));
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid TOTP code' }));
+          return;
+        }
+        
+        if (fs.existsSync(mfaSecretFile)) {
+          fs.unlinkSync(mfaSecretFile);
+        }
+        MFA_SECRET = null;
+        
+        auditLog('mfa_disabled', getClientIP(req));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Bad request' }));
@@ -1358,6 +1515,7 @@ const server = http.createServer((req, res) => {
       }
       return;
     }
+    // DESTRUCTIVE ACTION: restarts the OpenClaw gateway service. Frontend should show confirmation dialog.
     if (req.url === '/api/action/restart-openclaw' && req.method === 'POST') {
       try {
         auditLog('action_restart_openclaw', ip);
@@ -1415,7 +1573,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.url === '/api/action/kill-tmux' && req.method === 'POST') {
-      exec('tmux kill-server 2>/dev/null; echo ok', (err, stdout) => {
+      exec('tmux kill-session -t claude-persistent 2>/dev/null; echo ok', (err, stdout) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
       });
@@ -1436,6 +1594,7 @@ const server = http.createServer((req, res) => {
       });
       return;
     }
+    // DESTRUCTIVE ACTION: runs apt upgrade on the system. Frontend should show confirmation dialog.
     if (req.url === '/api/action/sys-update' && req.method === 'POST') {
       auditLog('action_sys_update', ip);
       exec('apt update -qq && apt upgrade -y -qq 2>&1 | tail -5', { timeout: 300000 }, (err, stdout) => {
@@ -1685,7 +1844,10 @@ const server = http.createServer((req, res) => {
       }
       return;
     }
-    if (req.url === '/api/live') {
+    // SECURITY NOTE: SSE endpoint accepts token via URL query param because EventSource API
+    // doesn't support custom headers. Token may appear in server logs and browser history.
+    // Mitigated by stripping token from audit logs below.
+    if (req.url === '/api/live' || req.url.startsWith('/api/live?')) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
