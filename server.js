@@ -215,10 +215,6 @@ function setSameSiteCORS(req, res) {
   } else if (!origin) {
     const proto = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
     res.setHeader('Access-Control-Allow-Origin', `${proto}://${host}`);
-  } else {
-    // Origin exists but doesn't match host - allow it for same-site scenarios
-    const proto = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-    res.setHeader('Access-Control-Allow-Origin', `${proto}://${host}`);
   }
 }
 
