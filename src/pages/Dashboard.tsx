@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { AGENT_META } from '../types';
+import { getAgentMeta } from '../types';
 import { formatCost, formatTokens, shortModel, timeAgo } from '../utils/format';
 
 export function Dashboard() {
@@ -114,7 +114,8 @@ export function Dashboard() {
       <div>
         <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 10 }}>AGENTS</div>
         <div className="desktop-grid" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {Object.entries(AGENT_META).map(([id, meta]) => {
+          {Object.keys(as).sort().map(id => {
+            const meta = getAgentMeta(id);
             const ss = as[id] || [];
             const live = ss.filter(s => Date.now() - s.updatedAt < 3600000).length;
             const last = [...ss].sort((a, b) => b.updatedAt - a.updatedAt)[0];

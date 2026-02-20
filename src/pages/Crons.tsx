@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { AGENT_META } from '../types';
+import { getAgentMeta } from '../types';
 import { countdown, formatDuration, shortModel, timeAgo } from '../utils/format';
 
 export function Crons() {
@@ -46,7 +46,7 @@ export function Crons() {
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {sorted.map(cr => {
-          const m = AGENT_META[cr.agentId];
+          const m = getAgentMeta(cr.agentId);
           const ok = cr.lastStatus === 'ok';
           const er = cr.lastStatus === 'error';
           const busy = toggling === cr.id;

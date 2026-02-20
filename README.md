@@ -90,7 +90,7 @@ services:
     environment:
       - DASHBOARD_PORT=8800
       - OPENCLAW_DIR=/openclaw
-      - WORKSPACE_DIR=/openclaw/agents/jianguo/workspace
+      - WORKSPACE_DIR=/openclaw/agents/main/workspace  # Change 'main' to your agent ID
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ALLOWED_TELEGRAM_IDS=${ALLOWED_TELEGRAM_IDS}
     restart: unless-stopped

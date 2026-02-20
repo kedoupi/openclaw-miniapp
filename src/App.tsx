@@ -8,12 +8,23 @@ import { System } from './pages/System';
 import { Config } from './pages/Config';
 import { LiveFeed } from './pages/LiveFeed';
 import { Layout } from './components/Layout';
+import { populateAgentMeta } from './types';
 import type { TabId } from './types';
+import { api } from './api/client';
 
 function App() {
   const { authenticated, loading, error } = useAuth();
   const [tab, setTab] = useState<TabId>('dashboard');
   const [refreshKey, setRefreshKey] = useState(0);
+
+  // Load agent metadata from topology API
+  useEffect(() => {
+    if (authenticated) {
+      api.getTopology().then(data => {
+        if (data?.nodes) populateAgentMeta(data.nodes);
+      }).catch(() => {});
+    }
+  }, [authenticated]);
 
   // Dark mode detection
   useEffect(() => {

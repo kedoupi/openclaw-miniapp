@@ -4,15 +4,32 @@ export interface AgentMeta {
   role: string;
 }
 
-export const AGENT_META: Record<string, AgentMeta> = {
-  jianguo:   { emoji: '🎯', label: '建国', role: '全能助手+调度中心' },
-  jingwen:   { emoji: '🌸', label: '靖雯', role: '生活管家' },
-  xiangchao: { emoji: '💻', label: '翔超', role: '全栈工程师' },
-  xiaowei:   { emoji: '📝', label: '小微', role: '公众号写手' },
-  kedoupi:   { emoji: '🔍', label: '珂抖屁', role: '技术雷达' },
-  laoli:     { emoji: '💰', label: '老李', role: '投资搭档' },
-  lushan:    { emoji: '🏔️', label: '卢山', role: '活动页面专家' },
-};
+// Agent metadata — dynamically populated from /api/topology on load.
+// This object starts empty and gets filled by populateAgentMeta().
+// If topology API is unavailable, agents will show with default 🤖 emoji and their ID as label.
+export const AGENT_META: Record<string, AgentMeta> = {};
+
+// Dynamically populated from /api/topology on first load
+let _agentMetaLoaded = false;
+
+export function getAgentMeta(id: string): AgentMeta {
+  return AGENT_META[id] || { emoji: '🤖', label: id, role: '' };
+}
+
+export function populateAgentMeta(nodes: Array<{ id: string; label: string; model: string; default: boolean }>) {
+  if (_agentMetaLoaded) return;
+  const emojis = ['🎯', '💻', '🌸', '📝', '🔍', '💰', '🏔️', '🚀', '⚡', '🔧'];
+  nodes.forEach((n, i) => {
+    if (!AGENT_META[n.id]) {
+      AGENT_META[n.id] = {
+        emoji: emojis[i % emojis.length],
+        label: n.label || n.id,
+        role: n.default ? 'default' : '',
+      };
+    }
+  });
+  _agentMetaLoaded = true;
+}
 
 export interface Session {
   key: string;

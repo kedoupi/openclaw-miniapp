@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { AGENT_META } from '../types';
+import { getAgentMeta } from '../types';
 
 type View = 'menu' | 'skills' | 'files' | 'editor' | 'memory' | 'memory-view' | 'topology' | 'budget';
 
@@ -75,7 +75,7 @@ function Skills({ onBack }: { onBack: () => void }) {
         <div>
           <SectionLabel>Agent 私有技能</SectionLabel>
           {Object.entries(data.perAgent).map(([agentId, skills]) => {
-            const meta = AGENT_META[agentId];
+            const meta = getAgentMeta(agentId);
             return (
               <div key={agentId} style={{ marginBottom: 12 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
@@ -110,7 +110,7 @@ function AgentFiles({ onBack, onEdit }: { onBack: () => void; onEdit: (agent: st
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <Header title="Agent 文件" onBack={onBack} />
       {data && Object.entries(data).map(([agentId, files]) => {
-        const meta = AGENT_META[agentId]; const open = expanded === agentId;
+        const meta = getAgentMeta(agentId); const open = expanded === agentId;
         const sorted = [...files].sort((a, b) => { const ai = coreFiles.indexOf(a.name); const bi = coreFiles.indexOf(b.name); if (ai >= 0 && bi >= 0) return ai - bi; if (ai >= 0) return -1; if (bi >= 0) return 1; return a.name.localeCompare(b.name); });
         return (
           <div key={agentId}>
@@ -141,7 +141,7 @@ function AgentFiles({ onBack, onEdit }: { onBack: () => void; onEdit: (agent: st
 
 /* ==================== File Editor ==================== */
 function FileEditor({ agent, file, onBack }: { agent: string; file: string; onBack: () => void }) {
-  const meta = AGENT_META[agent];
+  const meta = getAgentMeta(agent);
   const [content, setContent] = useState('');
   const [original, setOriginal] = useState('');
   const [loading, setLoading] = useState(true);
@@ -189,7 +189,7 @@ function MemoryBrowser({ onBack, onView }: { onBack: () => void; onView: (agent:
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <Header title="记忆浏览" onBack={onBack} />
       {data && Object.entries(data).map(([agentId, files]) => {
-        const meta = AGENT_META[agentId]; const open = expanded === agentId;
+        const meta = getAgentMeta(agentId); const open = expanded === agentId;
         if (files.length === 0) return null;
         return (
           <div key={agentId}>
@@ -225,7 +225,7 @@ function MemoryBrowser({ onBack, onView }: { onBack: () => void; onView: (agent:
 
 /* ==================== Memory Viewer ==================== */
 function MemoryViewer({ agent, file, onBack }: { agent: string; file: string; onBack: () => void }) {
-  const meta = AGENT_META[agent];
+  const meta = getAgentMeta(agent);
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
 
@@ -291,7 +291,7 @@ function Topology({ onBack }: { onBack: () => void }) {
           {/* Nodes */}
           {data.nodes.map(n => {
             const p = pos[n.id]; if (!p) return null;
-            const meta = AGENT_META[n.id]; const isHub = n.id === hub.id;
+            const meta = getAgentMeta(n.id); const isHub = n.id === hub.id;
             const sz = isHub ? 26 : 22;
             return (
               <g key={n.id}>
@@ -320,7 +320,7 @@ function Topology({ onBack }: { onBack: () => void }) {
         <SectionLabel>Agent 列表</SectionLabel>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
           {data.nodes.map(n => {
-            const meta = AGENT_META[n.id];
+            const meta = getAgentMeta(n.id);
             return (
               <div key={n.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

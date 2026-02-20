@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { AGENT_META } from '../types';
+import { getAgentMeta } from '../types';
 import { formatTokens, shortModel, timeAgo, extractAgentId } from '../utils/format';
 
 export function Sessions() {
@@ -10,13 +10,21 @@ export function Sessions() {
   const [exp, setExp] = useState<string | null>(null);
   const [cleaning, setCleaning] = useState<string | null>(null);
 
-  const list = useMemo(() => {
+  const enriched = useMemo(() => {
     if (!sessions) return [];
-    return sessions
-      .map(s => ({ ...s, agentId: s.agentId || extractAgentId(s.key) || '?' }))
+    return sessions.map(s => ({ ...s, agentId: s.agentId || extractAgentId(s.key) || '?' }));
+  }, [sessions]);
+
+  const agentIds = useMemo(() => {
+    const ids = new Set(enriched.map(s => s.agentId));
+    return Array.from(ids).sort();
+  }, [enriched]);
+
+  const list = useMemo(() => {
+    return enriched
       .filter(s => !fa || s.agentId === fa)
       .sort((a, b) => b.updatedAt - a.updatedAt);
-  }, [sessions, fa]);
+  }, [enriched, fa]);
 
   if (loading) return <div style={{ padding: 16 }}>{[1,2,3,4].map(i => <div key={i} className="sh" style={{ height: 68, marginBottom: 8 }} />)}</div>;
 
@@ -32,12 +40,12 @@ export function Sessions() {
 
       <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 2 }}>
         <Pill on={!fa} onClick={() => setFa(null)}>全部</Pill>
-        {Object.entries(AGENT_META).map(([id, m]) => <Pill key={id} on={fa === id} onClick={() => setFa(fa === id ? null : id)}>{m.emoji} {m.label}</Pill>)}
+        {agentIds.map(id => { const m = getAgentMeta(id); return <Pill key={id} on={fa === id} onClick={() => setFa(fa === id ? null : id)}>{m.emoji} {m.label}</Pill>; })}
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {list.slice(0, 40).map(s => {
-          const m = AGENT_META[s.agentId];
+          const m = getAgentMeta(s.agentId);
           const open = exp === s.key;
           const pct = Math.min((s.contextTokens / 200000) * 100, 100);
           const hot = Date.now() - s.updatedAt < 300000;

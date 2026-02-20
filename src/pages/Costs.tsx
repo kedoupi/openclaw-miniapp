@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useApi } from '../hooks/useApi';
 import { api } from '../api/client';
-import { AGENT_META } from '../types';
+import { getAgentMeta } from '../types';
 import { formatCost } from '../utils/format';
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 
@@ -20,7 +20,7 @@ export function Costs() {
 
   const ad = useMemo(() => {
     if (!cba) return [];
-    return cba.map(c => ({ name: AGENT_META[c.agentId]?.label || c.agentId, week: c.week }))
+    return cba.map(c => ({ name: getAgentMeta(c.agentId).label, week: c.week }))
       .filter(d => d.week > 0.01).sort((a, b) => b.week - a.week);
   }, [cba]);
 
