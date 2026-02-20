@@ -113,7 +113,7 @@ export function Dashboard() {
       {/* Agents */}
       <div>
         <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 10 }}>AGENTS</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div className="desktop-grid" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {Object.entries(AGENT_META).map(([id, meta]) => {
             const ss = as[id] || [];
             const live = ss.filter(s => Date.now() - s.updatedAt < 3600000).length;

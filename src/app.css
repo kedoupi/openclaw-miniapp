@@ -143,6 +143,128 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ===== Desktop Layout (≥768px) ===== */
+.desktop-layout {
+  display: flex;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--card);
+  border-right: 0.5px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 50;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 20px 16px;
+  border-bottom: 0.5px solid var(--border);
+}
+
+.sidebar-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 10px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.sidebar-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 500;
+  transition: all 0.15s;
+  text-align: left;
+  width: 100%;
+}
+
+.sidebar-btn:hover {
+  background: var(--card-alt);
+  color: var(--text-1);
+}
+
+.sidebar-btn.active {
+  background: rgba(0, 122, 255, 0.1);
+  color: var(--blue);
+}
+
+[data-theme="dark"] .sidebar-btn.active {
+  background: rgba(10, 132, 255, 0.15);
+}
+
+.desktop-main {
+  flex: 1;
+  margin-left: 220px;
+  min-height: 100vh;
+}
+
+.desktop-content {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px 32px;
+}
+
+/* Desktop: cards grid */
+@media (min-width: 768px) {
+  .desktop-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+  }
+  .desktop-grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+  .desktop-grid .full-width,
+  .desktop-grid-3 .full-width {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (min-width: 1200px) {
+  .desktop-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .desktop-grid-3 {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* Desktop scrollbar */
+@media (min-width: 768px) {
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+}
+
 /* Live feed */
 .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--red); animation: pulse 2s ease infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }

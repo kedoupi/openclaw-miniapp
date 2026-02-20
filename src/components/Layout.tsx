@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react';
 import type { TabId } from '../types';
 
 const TABS: { id: TabId; label: string; d: string }[] = [
@@ -10,7 +11,48 @@ const TABS: { id: TabId; label: string; d: string }[] = [
   { id: 'config', label: '配置', d: 'M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z' },
 ];
 
+function useIsDesktop() {
+  const [isDesktop, setIsDesktop] = useState(window.innerWidth >= 768);
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 768px)');
+    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+  return isDesktop;
+}
+
 export function Layout({ children, activeTab, onTabChange }: { children: React.ReactNode; activeTab: TabId; onTabChange: (t: TabId) => void }) {
+  const isDesktop = useIsDesktop();
+
+  if (isDesktop) {
+    return (
+      <div className="desktop-layout">
+        <aside className="sidebar">
+          <div className="sidebar-header">
+            <span style={{ fontSize: 20 }}>🎯</span>
+            <span className="sidebar-title">OpenClaw</span>
+          </div>
+          <nav className="sidebar-nav">
+            {TABS.map(t => (
+              <button key={t.id} className={`sidebar-btn ${activeTab === t.id ? 'active' : ''}`} onClick={() => onTabChange(t.id)}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  strokeWidth={activeTab === t.id ? 2 : 1.5} strokeLinecap="round" strokeLinejoin="round">
+                  <path d={t.d} />
+                </svg>
+                <span>{t.label}</span>
+              </button>
+            ))}
+          </nav>
+        </aside>
+        <main className="desktop-main">
+          <div className="desktop-content fi">{children}</div>
+        </main>
+      </div>
+    );
+  }
+
+  // Mobile: bottom tab bar
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
       <div className="page fi">{children}</div>
