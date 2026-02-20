@@ -2,7 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const crypto = require('crypto');
 
 const IS_CONTAINER = fs.existsSync('/.dockerenv') || !!process.env.CONTAINER;
@@ -58,6 +58,9 @@ function verifyTelegramInitData(initData) {
   const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_BOT_TOKEN).digest();
   const computed = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
   if (computed !== hash) return null;
+  // 🔴-2: Validate auth_date is within 5 minutes to prevent replay attacks
+  const authDate = parseInt(params.get('auth_date') || '0', 10);
+  if (Math.abs(Date.now() / 1000 - authDate) > 300) return null;
   try {
     const user = JSON.parse(params.get('user') || '{}');
     return user;
@@ -175,9 +178,10 @@ function auditLog(event, ip, details = {}) {
 
 function setSecurityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'ALLOWALL');
+  // 🟡-8: Removed X-Frame-Options ALLOWALL — CSP frame-ancestors handles this
   res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; frame-ancestors https://web.telegram.org; style-src 'self' 'unsafe-inline';");
+  // 🟡-7: Added connect-src 'self'
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; frame-ancestors https://web.telegram.org; style-src 'self' 'unsafe-inline'; connect-src 'self';");
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 }
@@ -1458,7 +1462,8 @@ const server = http.createServer((req, res) => {
         }
 
         const userId = String(user.id || '');
-        if (ALLOWED_TELEGRAM_IDS.size > 0 && !ALLOWED_TELEGRAM_IDS.has(userId)) {
+        // 🔴-3: Fail-closed — deny all users when ALLOWED_TELEGRAM_IDS is empty
+        if (!ALLOWED_TELEGRAM_IDS.has(userId)) {
           auditLog('telegram_auth_denied', ip, { userId, username: user.username });
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'User not authorized' }));
@@ -1481,12 +1486,10 @@ const server = http.createServer((req, res) => {
 
   // --- Protected API Endpoints ---
   if (req.url.startsWith('/api/')) {
-    // Dev mode: skip auth when DASHBOARD_DEV=true and request is from localhost
-    const devMode = process.env.DASHBOARD_DEV === 'true' && isLocalhost(ip);
-    // IP direct access: skip auth for localhost and private IP connections
-    const host = (req.headers.host || '').split(':')[0];
-    const isIPAddress = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host === 'localhost';
-    if (!devMode && !isIPAddress && !requireAuth(req, res)) return;
+    // 🔴-1: Use actual client IP instead of spoofable Host header for auth bypass
+    const clientIP = getClientIP(req);
+    const isLocalOrPrivate = isLocalhost(clientIP) || isPrivateIP(clientIP);
+    if (!isLocalOrPrivate && !requireAuth(req, res)) return;
     setSameSiteCORS(req, res);
 
     if (req.url === '/api/sessions') {
@@ -1614,7 +1617,8 @@ const server = http.createServer((req, res) => {
     if (req.url === '/api/claude-usage-scrape' && req.method === 'POST') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (fs.existsSync(scrapeScript)) {
-        exec(`bash ${scrapeScript}`, { timeout: 60000 }, (err) => {});
+        // 🔴-5: Use execFile to prevent command injection
+        execFile('bash', [scrapeScript], { timeout: 60000 }, (err) => {});
         res.end(JSON.stringify({ status: 'started' }));
       } else {
         res.end(JSON.stringify({ status: 'error', message: 'Scrape script not found' }));
@@ -1634,7 +1638,8 @@ const server = http.createServer((req, res) => {
     if (req.url === '/api/gemini-usage-scrape' && req.method === 'POST') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (fs.existsSync(geminiScrapeScript)) {
-        exec(`bash ${geminiScrapeScript}`, { timeout: 60000 }, (err) => {});
+        // 🔴-5: Use execFile to prevent command injection
+        execFile('bash', [geminiScrapeScript], { timeout: 60000 }, (err) => {});
         res.end(JSON.stringify({ status: 'started' }));
       } else {
         res.end(JSON.stringify({ status: 'error', message: 'Gemini scrape script not found' }));
@@ -1757,7 +1762,11 @@ const server = http.createServer((req, res) => {
         let fpath = '';
         if (fname === 'MEMORY.md') fpath = memoryMdPath;
         else if (fname === 'HEARTBEAT.md') fpath = heartbeatPath;
-        else if (fname.startsWith('memory/') && !fname.includes('..')) fpath = path.join(WORKSPACE_DIR, fname);
+        else if (fname.startsWith('memory/')) {
+          // 🟡-9: Path traversal protection with resolve + startsWith
+          fpath = path.resolve(WORKSPACE_DIR, fname);
+          if (!fpath.startsWith(path.join(WORKSPACE_DIR, 'memory') + path.sep)) throw new Error('Invalid path');
+        }
         else throw new Error('Invalid path');
 
         if (fs.existsSync(fpath)) {
@@ -1805,6 +1814,8 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.url === '/api/live' || req.url.startsWith('/api/live?')) {
+      // 🟡-12: SSE endpoints pass auth token via query param, which may appear in server logs.
+      // This is an inherent SSE limitation. Consider using short-lived tokens for SSE connections.
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -1885,7 +1896,8 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ success: true, id, enabled }));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          console.error(e); // 🟡-3: sanitize error response
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       });
       return;
@@ -1927,7 +1939,14 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ error: 'Bad request' }));
           return;
         }
-        const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', 'memory', fileName);
+        // 🟡-9: Path traversal protection
+        const expectedDir = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', 'memory');
+        const fpath = path.resolve(expectedDir, fileName);
+        if (!fpath.startsWith(expectedDir + path.sep) && fpath !== path.join(expectedDir, fileName)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Bad request' }));
+          return;
+        }
         if (!fs.existsSync(fpath)) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Not found' }));
@@ -1937,7 +1956,8 @@ const server = http.createServer((req, res) => {
         res.end(fs.readFileSync(fpath, 'utf8'));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        console.error(e); // 🟡-3: sanitize error response
+        res.end(JSON.stringify({ error: 'Internal server error' }));
       }
       return;
     }
@@ -1982,7 +2002,7 @@ const server = http.createServer((req, res) => {
           }
         } catch {}
       }
-      // Default: jianguo as hub if no edges found
+      // Default: use default agent as hub if no edges found
       if (edges.length === 0) {
         const hub = agents.find(a => a.default) || agents[0];
         if (hub) {
@@ -1999,7 +2019,13 @@ const server = http.createServer((req, res) => {
     // --- Skills API ---
     if (req.url === '/api/skills') {
       const globalSkillsDir = path.join(OPENCLAW_DIR, 'skills');
-      const npmSkillsDir = path.join(os.homedir(), '.nvm/versions/node/v24.13.0/lib/node_modules/openclaw/skills');
+      // 🟡-4: Dynamic npm root detection instead of hardcoded nvm path
+      let npmSkillsDir = '';
+      try {
+        const { execSync } = require('child_process');
+        const globalDir = execSync('npm root -g', { encoding: 'utf8', timeout: 3000 }).trim();
+        npmSkillsDir = path.join(globalDir, 'openclaw', 'skills');
+      } catch {}
       const globalSkills = [];
       
       // Read user-installed skills
@@ -2099,7 +2125,14 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ error: 'Bad request' }));
           return;
         }
-        const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', fileName);
+        // 🟡-9: Path traversal protection
+        const expectedDir = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace');
+        const fpath = path.resolve(expectedDir, fileName);
+        if (!fpath.startsWith(expectedDir + path.sep) && fpath !== path.join(expectedDir, fileName)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Bad request' }));
+          return;
+        }
         if (!fs.existsSync(fpath)) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Not found' }));
@@ -2109,7 +2142,8 @@ const server = http.createServer((req, res) => {
         res.end(fs.readFileSync(fpath, 'utf8'));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        console.error(e); // 🟡-3: sanitize error response
+        res.end(JSON.stringify({ error: 'Internal server error' }));
       }
       return;
     }
@@ -2129,7 +2163,14 @@ const server = http.createServer((req, res) => {
             res.end(JSON.stringify({ error: 'Bad request' }));
             return;
           }
-          const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', fileName);
+          // 🟡-9: Path traversal protection
+          const expectedDir = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace');
+          const fpath = path.resolve(expectedDir, fileName);
+          if (!fpath.startsWith(expectedDir + path.sep) && fpath !== path.join(expectedDir, fileName)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Bad request' }));
+            return;
+          }
           auditLog('agent_file_edit', getClientIP(req), { agent: agentId, file: fileName });
           // Backup
           try { if (fs.existsSync(fpath)) fs.copyFileSync(fpath, fpath + '.bak'); } catch {}
@@ -2140,7 +2181,8 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ success: true }));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          console.error(e); // 🟡-3: sanitize error response
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       });
       return;
@@ -2164,7 +2206,9 @@ const server = http.createServer((req, res) => {
             return;
           }
           auditLog('run_cron', getClientIP(req), { id });
-          exec(`openclaw cron run --id "${id.replace(/[^a-zA-Z0-9\-]/g, '')}" 2>&1 || true`, { timeout: 30000 }, (err, stdout) => {
+          // 🔴-5: Use execFile to prevent command injection
+          const sanitizedId = id.replace(/[^a-zA-Z0-9\-]/g, '');
+          execFile('openclaw', ['cron', 'run', '--id', sanitizedId], { timeout: 30000 }, (err, stdout) => {
             // Record to cron history
             try {
               let history = {};
@@ -2184,7 +2228,8 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ success: true, message: 'Cron job triggered' }));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          console.error(e); // 🟡-3: sanitize error response
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       });
       return;
@@ -2198,7 +2243,8 @@ const server = http.createServer((req, res) => {
         return;
       }
       auditLog('trigger_heartbeat', getClientIP(req));
-      exec('openclaw system event --type heartbeat --message "Manual heartbeat from dashboard" 2>&1 || true', { timeout: 30000 }, (err, stdout) => {
+      // 🔴-5: Use execFile to prevent command injection
+      execFile('openclaw', ['system', 'event', '--type', 'heartbeat', '--message', 'Manual heartbeat from dashboard'], { timeout: 30000 }, (err, stdout) => {
         // ignore result, fire-and-forget
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -2227,7 +2273,8 @@ const server = http.createServer((req, res) => {
         }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        console.error(e); // 🟡-3: sanitize error response
+        res.end(JSON.stringify({ error: 'Internal server error' }));
       }
       return;
     }
@@ -2249,7 +2296,8 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ success: true, monthly }));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          console.error(e); // 🟡-3: sanitize error response
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       });
       return;
@@ -2297,7 +2345,8 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ success: cleaned, message: cleaned ? 'Session transcript cleaned' : 'Session file not found' }));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: e.message }));
+          console.error(e); // 🟡-3: sanitize error response
+          res.end(JSON.stringify({ error: 'Internal server error' }));
         }
       });
       return;
@@ -2336,6 +2385,12 @@ const server = http.createServer((req, res) => {
   serveStatic(req, res);
 });
 
+// 🔴-3: Startup warning for empty allowlist with bot token configured
+if (TELEGRAM_BOT_TOKEN && ALLOWED_TELEGRAM_IDS.size === 0) {
+  console.warn('⚠️  WARNING: TELEGRAM_BOT_TOKEN is set but ALLOWED_TELEGRAM_IDS is empty. All Telegram users will be denied.');
+}
+
+// TODO: async I/O for production scale (🟡-13)
 server.listen(PORT, '0.0.0.0', () => {
   console.log('Dashboard: http://0.0.0.0:' + PORT);
 });

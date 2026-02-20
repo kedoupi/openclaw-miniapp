@@ -5,13 +5,16 @@ services:
     ports:
       - "8800:8800"
     volumes:
+      # 🟡-14: These volumes give the container read access to all OpenClaw config and agent data.
+      # In production, consider mounting only the specific agent workspace needed.
       - ~/.openclaw:/openclaw:ro
       - ~/.openclaw/agents:/openclaw/agents:rw
       - dashboard-data:/app/data
     environment:
       - DASHBOARD_PORT=8800
       - OPENCLAW_DIR=/openclaw
-      - WORKSPACE_DIR=/openclaw/agents/jianguo/workspace
+      # 🟡-5: Use env var instead of hardcoded agent name
+      - WORKSPACE_DIR=/openclaw/agents/${OPENCLAW_AGENT:-main}/workspace
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - ALLOWED_TELEGRAM_IDS=${ALLOWED_TELEGRAM_IDS:-}
     restart: unless-stopped

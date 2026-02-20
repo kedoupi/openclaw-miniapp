@@ -35,6 +35,7 @@ Thumbs.db
 # Build outputs (if any in future)
 dist/
 build/
+tsconfig.tsbuildinfo
 
 # Private data
 MEMORY.md

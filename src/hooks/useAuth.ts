@@ -19,12 +19,7 @@ export function useAuth() {
     const initData = webApp?.initData;
 
     if (!initData) {
-      // Dev mode: skip auth
-      if ((import.meta as any).env?.DEV) {
-        setAuthenticated(true);
-        setLoading(false);
-        return;
-      }
+      // 🔴-4: Removed DEV mode auth bypass — backend handles auth via client IP check
       // IP direct access: skip Telegram auth
       const host = window.location.hostname;
       const isIP = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host === 'localhost' || host === '127.0.0.1';
