@@ -5,20 +5,17 @@ const os = require('os');
 const { exec } = require('child_process');
 const crypto = require('crypto');
 
+const IS_CONTAINER = fs.existsSync('/.dockerenv') || !!process.env.CONTAINER;
 const PORT = parseInt(process.env.DASHBOARD_PORT || '7000');
 const OPENCLAW_DIR = process.env.OPENCLAW_DIR || path.join(os.homedir(), '.openclaw');
 const WORKSPACE_DIR = process.env.WORKSPACE_DIR || process.env.OPENCLAW_WORKSPACE || process.cwd();
-const AGENT_ID = process.env.OPENCLAW_AGENT || 'main';
-const sessDir = path.join(OPENCLAW_DIR, 'agents', AGENT_ID, 'sessions');
 const cronFile = path.join(OPENCLAW_DIR, 'cron', 'jobs.json');
-const dataDir = path.join(WORKSPACE_DIR, 'data');
+const dataDir = IS_CONTAINER ? '/app/data' : path.join(WORKSPACE_DIR, 'data');
 const memoryDir = path.join(WORKSPACE_DIR, 'memory');
 const memoryMdPath = path.join(WORKSPACE_DIR, 'MEMORY.md');
 const heartbeatPath = path.join(WORKSPACE_DIR, 'HEARTBEAT.md');
 const healthHistoryFile = path.join(dataDir, 'health-history.json');
 const auditLogPath = path.join(dataDir, 'audit.log');
-const credentialsFile = path.join(dataDir, 'credentials.json');
-const mfaSecretFile = path.join(dataDir, 'mfa-secret.txt');
 
 const skillsDir = path.join(WORKSPACE_DIR, 'skills');
 const configFiles = [
@@ -31,65 +28,48 @@ const geminiUsageFile = path.join(dataDir, 'gemini-usage.json');
 const scrapeScript = path.join(WORKSPACE_DIR, 'scripts', 'scrape-claude-usage.sh');
 const geminiScrapeScript = path.join(WORKSPACE_DIR, 'scripts', 'scrape-gemini-usage.sh');
 
-const htmlPath = path.join(__dirname, 'index.html');
+const distDir = path.join(__dirname, 'dist');
+const dashboardDataDir = IS_CONTAINER
+  ? path.join(OPENCLAW_DIR, 'dashboard-data')
+  : path.join(os.homedir(), '.openclaw', 'dashboard-data');
+const budgetFile = path.join(dashboardDataDir, 'budget.json');
+const cronHistoryFile = path.join(dashboardDataDir, 'cron-history.json');
 
 try { fs.mkdirSync(dataDir, { recursive: true }); } catch {}
 try { fs.mkdirSync(path.dirname(auditLogPath), { recursive: true }); } catch {}
-try { fs.mkdirSync(path.dirname(credentialsFile), { recursive: true }); } catch {}
+try { fs.mkdirSync(dashboardDataDir, { recursive: true }); } catch {}
 
-let DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN;
-if (!DASHBOARD_TOKEN) {
-  DASHBOARD_TOKEN = crypto.randomBytes(16).toString('hex');
-}
+// --- Telegram Auth ---
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const ALLOWED_TELEGRAM_IDS = new Set(
+  (process.env.ALLOWED_TELEGRAM_IDS || '').split(',').filter(Boolean)
+);
 
-console.log('');
-console.log('═══════════════════════════════════════════════════════════');
-console.log('  🔐 Recovery Token');
-console.log('═══════════════════════════════════════════════════════════');
-console.log('');
-console.log('  ' + DASHBOARD_TOKEN);
-console.log('');
-console.log('  Use this token to reset your password if forgotten.');
-console.log('  Set DASHBOARD_TOKEN env variable for a custom token.');
-console.log('═══════════════════════════════════════════════════════════');
-console.log('');
-
-let MFA_SECRET = process.env.DASHBOARD_MFA_SECRET;
-if (!MFA_SECRET && fs.existsSync(mfaSecretFile)) {
+function verifyTelegramInitData(initData) {
+  if (!TELEGRAM_BOT_TOKEN) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_BOT_TOKEN).digest();
+  const computed = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+  if (computed !== hash) return null;
   try {
-    MFA_SECRET = fs.readFileSync(mfaSecretFile, 'utf8').trim();
-  } catch {}
+    const user = JSON.parse(params.get('user') || '{}');
+    return user;
+  } catch { return null; }
 }
 
+// --- Session Management ---
 const sessions = new Map();
 const SESSION_ACTIVITY_TIMEOUT = 30 * 60 * 1000;
 const SESSION_REMEMBER_LIFETIME = 3 * 60 * 60 * 1000;
 
-function hashPassword(password, salt) {
-  if (!salt) salt = crypto.randomBytes(32).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-  return { hash, salt };
-}
-
-function verifyPassword(password, hash, salt) {
-  const result = crypto.pbkdf2Sync(password, salt, 100000, 64, 'sha512').toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(result), Buffer.from(hash));
-}
-
-function getCredentials() {
-  try {
-    if (!fs.existsSync(credentialsFile)) return null;
-    return JSON.parse(fs.readFileSync(credentialsFile, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function saveCredentials(creds) {
-  const tmp = credentialsFile + '.tmp.' + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(creds, null, 2), 'utf8');
-  fs.renameSync(tmp, credentialsFile);
-}
+const READ_ONLY_FILES = new Set(['openclaw-gateway.service', 'openclaw-config.json']);
 
 function generateSessionToken() {
   return crypto.randomBytes(32).toString('hex');
@@ -110,80 +90,73 @@ function createSession(username, ip, rememberMe = false) {
   return token;
 }
 
-function validatePassword(password) {
-  if (password.length < 8) return 'Password must be at least 8 characters';
-  if (!/[a-zA-Z]/.test(password)) return 'Password must contain at least 1 letter';
-  if (!/\d/.test(password)) return 'Password must contain at least 1 number';
-  return null;
-}
-
-function safeCompare(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-function base32Decode(input) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let bits = '';
-  for (const char of input.toUpperCase().replace(/=+$/, '')) {
-    const val = alphabet.indexOf(char);
-    if (val === -1) continue;
-    bits += val.toString(2).padStart(5, '0');
+function isAuthenticated(req) {
+  const authHeader = req.headers.authorization;
+  let token = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.substring(7);
+  } else {
+    const url = new URL(req.url, 'http://localhost');
+    token = url.searchParams.get('token');
   }
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    bytes.push(parseInt(bits.substring(i, i + 8), 2));
+  if (!token) return false;
+
+  const session = sessions.get(token);
+  if (!session) return false;
+
+  const now = Date.now();
+  if (now > session.expiresAt) {
+    sessions.delete(token);
+    return false;
   }
-  return Buffer.from(bytes);
+
+  if (!session.rememberMe) {
+    if (now - session.lastActivity > SESSION_ACTIVITY_TIMEOUT) {
+      sessions.delete(token);
+      return false;
+    }
+    session.lastActivity = now;
+  }
+
+  return true;
 }
 
-function base32Encode(buffer) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  let bits = '';
-  for (const byte of buffer) {
-    bits += byte.toString(2).padStart(8, '0');
+function requireAuth(req, res) {
+  if (!isAuthenticated(req)) {
+    setSecurityHeaders(res);
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return false;
   }
-  let result = '';
-  for (let i = 0; i < bits.length; i += 5) {
-    const chunk = bits.substring(i, i + 5).padEnd(5, '0');
-    result += alphabet[parseInt(chunk, 2)];
-  }
-  return result;
+  return true;
 }
 
-function generateTOTP(secret, timeStep = 30, digits = 6, window = 0) {
-  const epoch = Math.floor(Date.now() / 1000);
-  const counter = Math.floor(epoch / timeStep) + window;
-  const counterBuffer = Buffer.alloc(8);
-  counterBuffer.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
-  counterBuffer.writeUInt32BE(counter & 0xFFFFFFFF, 4);
-  
-  const decodedSecret = base32Decode(secret);
-  const hmac = crypto.createHmac('sha1', decodedSecret);
-  hmac.update(counterBuffer);
-  const hash = hmac.digest();
-  
-  const offset = hash[hash.length - 1] & 0x0f;
-  const binary = ((hash[offset] & 0x7f) << 24) | ((hash[offset + 1] & 0xff) << 16) | ((hash[offset + 2] & 0xff) << 8) | (hash[offset + 3] & 0xff);
-  const otp = binary % (10 ** digits);
-  return otp.toString().padStart(digits, '0');
+// --- Multi-Agent Support ---
+function getAgentList() {
+  try {
+    const configPath = path.join(OPENCLAW_DIR, 'openclaw.json');
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return config.agents?.list || [];
+  } catch { return []; }
 }
 
-function verifyTOTP(secret, code) {
-  for (let w = -1; w <= 1; w++) {
-    if (generateTOTP(secret, 30, 6, w) === code) return true;
+function getAllSessionDirs() {
+  const agents = getAgentList();
+  const dirs = [];
+  for (const agent of agents) {
+    const dir = path.join(OPENCLAW_DIR, 'agents', agent.id, 'sessions');
+    if (fs.existsSync(dir)) dirs.push({ agentId: agent.id, dir });
   }
-  return false;
+  // Fallback to the original single agent if no config
+  if (dirs.length === 0) {
+    const fallbackId = process.env.OPENCLAW_AGENT || 'main';
+    const dir = path.join(OPENCLAW_DIR, 'agents', fallbackId, 'sessions');
+    if (fs.existsSync(dir)) dirs.push({ agentId: fallbackId, dir });
+  }
+  return dirs;
 }
 
-const rateLimitStore = new Map();
-const pendingMfaSecrets = new Map();
-const MAX_FILE_BODY = 1024 * 1024;
-const READ_ONLY_FILES = new Set(['openclaw-gateway.service', 'openclaw-config.json']);
-
+// --- Utility Functions ---
 function auditLog(event, ip, details = {}) {
   try {
     const timestamp = new Date().toISOString();
@@ -202,9 +175,9 @@ function auditLog(event, ip, details = {}) {
 
 function setSecurityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
   res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; frame-ancestors https://web.telegram.org; style-src 'self' 'unsafe-inline';");
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 }
@@ -220,35 +193,6 @@ function setSameSiteCORS(req, res) {
   }
 }
 
-function checkRateLimit(ip) {
-  const now = Date.now();
-  const attempts = rateLimitStore.get(ip) || [];
-  const recent = attempts.filter(t => now - t < 15 * 60 * 1000);
-  rateLimitStore.set(ip, recent);
-  if (recent.length >= 20) {
-    const lastAttempt = recent[recent.length - 1];
-    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - lastAttempt)) / 1000);
-    return { blocked: true, softLocked: true, remainingSeconds: lockoutRemaining };
-  }
-  if (recent.length >= 5) {
-    const lastAttempt = recent[recent.length - 1];
-    const lockoutRemaining = Math.ceil((15 * 60 * 1000 - (now - lastAttempt)) / 1000);
-    return { blocked: false, softLocked: true, remainingSeconds: lockoutRemaining };
-  }
-  return { blocked: false, softLocked: false };
-}
-
-function recordFailedAuth(ip) {
-  const now = Date.now();
-  const attempts = rateLimitStore.get(ip) || [];
-  attempts.push(now);
-  rateLimitStore.set(ip, attempts);
-}
-
-function clearFailedAuth(ip) {
-  rateLimitStore.delete(ip);
-}
-
 function getClientIP(req) {
   return req.socket.remoteAddress || 'unknown';
 }
@@ -262,10 +206,26 @@ function isTailscaleIP(ip) {
   return clean.startsWith('100.') && parseInt(clean.split('.')[1]) >= 64 && parseInt(clean.split('.')[1]) <= 127;
 }
 
+function isPrivateIP(ip) {
+  const clean = ip.replace('::ffff:', '');
+  // 10.0.0.0/8
+  if (clean.startsWith('10.')) return true;
+  // 192.168.0.0/16
+  if (clean.startsWith('192.168.')) return true;
+  // 172.16.0.0/12
+  const parts = clean.split('.');
+  if (parts.length === 4 && parts[0] === '172') {
+    const second = parseInt(parts[1], 10);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
+
 function httpsEnforcement(req, res) {
   if (process.env.DASHBOARD_ALLOW_HTTP === 'true') return true;
   const ip = getClientIP(req);
   if (isLocalhost(ip)) return true;
+  if (isPrivateIP(ip)) return true;  // 内网 IP 直接放行
   if (req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https') return true;
   setSecurityHeaders(res);
   res.writeHead(403, { 'Content-Type': 'text/plain' });
@@ -273,57 +233,7 @@ function httpsEnforcement(req, res) {
   return false;
 }
 
-function isAuthenticated(req) {
-  const authHeader = req.headers.authorization;
-  let token = null;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.substring(7);
-  } else {
-    const url = new URL(req.url, 'http://localhost');
-    token = url.searchParams.get('token');
-  }
-  if (!token) return false;
-  
-  const session = sessions.get(token);
-  if (!session) return false;
-  
-  const now = Date.now();
-  if (now > session.expiresAt) {
-    sessions.delete(token);
-    return false;
-  }
-  
-  if (!session.rememberMe) {
-    if (now - session.lastActivity > SESSION_ACTIVITY_TIMEOUT) {
-      sessions.delete(token);
-      return false;
-    }
-    session.lastActivity = now;
-  }
-  
-  return true;
-}
-
-function requireAuth(req, res) {
-  const ip = getClientIP(req);
-  const limitCheck = checkRateLimit(ip);
-  if (limitCheck.blocked) {
-    setSecurityHeaders(res);
-    res.writeHead(429, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Too many failed attempts', retryAfter: limitCheck.remainingSeconds }));
-    return false;
-  }
-  
-  if (!isAuthenticated(req)) {
-    const sanitizedUrl = req.url.replace(/token=[^&]+/g, 'token=REDACTED');
-    setSecurityHeaders(res);
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unauthorized' }));
-    return false;
-  }
-  return true;
-}
-
+// --- Git Repos ---
 function getGitRepos() {
   const repos = [];
   const projDir = path.join(WORKSPACE_DIR, 'projects');
@@ -339,6 +249,7 @@ function getGitRepos() {
   return repos;
 }
 
+// --- Session Data Helpers ---
 function resolveName(key) {
   if (key.includes(':main:main')) return 'main';
   if (key.includes('teleg')) return 'telegram-group';
@@ -364,33 +275,43 @@ function resolveName(key) {
   return key.split(':').pop().substring(0, 12);
 }
 
+function extractAgentIdFromKey(key) {
+  // Parse keys like "agent:<agentId>:main" or "agent:<agentId>:cron:..."
+  const match = key.match(/^agent:([^:]+):/);
+  return match ? match[1] : '';
+}
+
 function getLastMessage(sessionId) {
-  try {
-    const filePath = path.join(sessDir, sessionId + '.jsonl');
-    if (!fs.existsSync(filePath)) return '';
-    const data = fs.readFileSync(filePath, 'utf8');
-    const lines = data.split('\n').filter(l => l.trim());
-    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
-      try {
-        const d = JSON.parse(lines[i]);
-        if (d.type !== 'message') continue;
-        const msg = d.message;
-        if (!msg) continue;
-        const role = msg.role;
-        if (role !== 'user' && role !== 'assistant') continue;
-        let text = '';
-        if (typeof msg.content === 'string') {
-          text = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          for (const b of msg.content) {
-            if (b.type === 'text' && b.text) { text = b.text; break; }
+  const agentDirs = getAllSessionDirs();
+  for (const { dir } of agentDirs) {
+    try {
+      const filePath = path.join(dir, sessionId + '.jsonl');
+      if (!fs.existsSync(filePath)) continue;
+      const data = fs.readFileSync(filePath, 'utf8');
+      const lines = data.split('\n').filter(l => l.trim());
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+        try {
+          const d = JSON.parse(lines[i]);
+          if (d.type !== 'message') continue;
+          const msg = d.message;
+          if (!msg) continue;
+          const role = msg.role;
+          if (role !== 'user' && role !== 'assistant') continue;
+          let text = '';
+          if (typeof msg.content === 'string') {
+            text = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            for (const b of msg.content) {
+              if (b.type === 'text' && b.text) { text = b.text; break; }
+            }
           }
-        }
-        if (text) return text.replace(/\n/g, ' ').substring(0, 80);
-      } catch {}
-    }
-    return '';
-  } catch { return ''; }
+          if (text) return text.replace(/\n/g, ' ').substring(0, 80);
+        } catch {}
+      }
+      return '';
+    } catch {}
+  }
+  return '';
 }
 
 function isSessionFile(f) { return f.endsWith('.jsonl') || f.includes('.jsonl.reset.'); }
@@ -404,159 +325,181 @@ function getSessionCost(sessionId) {
   if (now - sessionCostCacheTime > 60000) {
     sessionCostCache = {};
     sessionCostCacheTime = now;
-    try {
-      const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
-      for (const file of files) {
-        const sid = extractSessionId(file);
-        let total = 0;
-        const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const d = JSON.parse(line);
-            if (d.type !== 'message') continue;
-            const c = d.message?.usage?.cost?.total || 0;
-            if (c > 0) total += c;
-          } catch {}
+    const agentDirs = getAllSessionDirs();
+    for (const { dir } of agentDirs) {
+      try {
+        const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+        for (const file of files) {
+          const sid = extractSessionId(file);
+          let total = 0;
+          const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const d = JSON.parse(line);
+              if (d.type !== 'message') continue;
+              const c = d.message?.usage?.cost?.total || 0;
+              if (c > 0) total += c;
+            } catch {}
+          }
+          if (total > 0) sessionCostCache[sid] = Math.round(total * 100) / 100;
         }
-        if (total > 0) sessionCostCache[sid] = Math.round(total * 100) / 100;
-      }
-    } catch {}
+      } catch {}
+    }
   }
   return sessionCostCache[sessionId] || 0;
 }
 
 function getSessionsJson() {
-  try {
-    const sFile = path.join(sessDir, 'sessions.json');
-    const data = JSON.parse(fs.readFileSync(sFile, 'utf8'));
-    return Object.entries(data).map(([key, s]) => ({
-      key,
-      label: s.label || resolveName(key),
-      model: s.modelOverride || s.model || '-',
-      totalTokens: s.totalTokens || 0,
-      contextTokens: s.contextTokens || 0,
-      kind: s.kind || (key.includes('group') ? 'group' : 'direct'),
-      updatedAt: s.updatedAt || 0,
-      createdAt: s.createdAt || s.updatedAt || 0,
-      aborted: s.abortedLastRun || false,
-      thinkingLevel: s.thinkingLevel || null,
-      channel: s.channel || '-',
-      sessionId: s.sessionId || '-',
-      lastMessage: getLastMessage(s.sessionId || key),
-      cost: getSessionCost(s.sessionId || key)
-    }));
-  } catch (e) { return []; }
+  const agentDirs = getAllSessionDirs();
+  const allSessions = [];
+  for (const { agentId, dir } of agentDirs) {
+    try {
+      const sFile = path.join(dir, 'sessions.json');
+      const data = JSON.parse(fs.readFileSync(sFile, 'utf8'));
+      for (const [key, s] of Object.entries(data)) {
+        const keyAgentId = extractAgentIdFromKey(key) || agentId;
+        allSessions.push({
+          key,
+          agentId: keyAgentId,
+          label: s.label || resolveName(key),
+          model: s.modelOverride || s.model || '-',
+          totalTokens: s.totalTokens || 0,
+          contextTokens: s.contextTokens || 0,
+          kind: s.kind || (key.includes('group') ? 'group' : 'direct'),
+          updatedAt: s.updatedAt || 0,
+          createdAt: s.createdAt || s.updatedAt || 0,
+          aborted: s.abortedLastRun || false,
+          thinkingLevel: s.thinkingLevel || null,
+          channel: s.channel || '-',
+          sessionId: s.sessionId || '-',
+          lastMessage: getLastMessage(s.sessionId || key),
+          cost: getSessionCost(s.sessionId || key)
+        });
+      }
+    } catch {}
+  }
+  return allSessions;
 }
 
 function getCostData() {
   try {
-    const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
+    const agentDirs = getAllSessionDirs();
     const perModel = {};
     const perDay = {};
     const perSession = {};
     let total = 0;
 
-    for (const file of files) {
-      const sid = extractSessionId(file);
-      let scost = 0;
-      const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const d = JSON.parse(line);
-          if (d.type !== 'message') continue;
-          const msg = d.message;
-          if (!msg || !msg.usage || !msg.usage.cost) continue;
-          const c = msg.usage.cost.total || 0;
-          if (c <= 0) continue;
-          const model = msg.model || 'unknown';
-          if (model.includes('delivery-mirror')) continue;
-          const ts = d.timestamp || '';
-          const day = ts.substring(0, 10);
-          perModel[model] = (perModel[model] || 0) + c;
-          perDay[day] = (perDay[day] || 0) + c;
-          scost += c;
-          total += c;
-        } catch {}
+    for (const { dir } of agentDirs) {
+      const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+      for (const file of files) {
+        const sid = extractSessionId(file);
+        let scost = 0;
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            if (d.type !== 'message') continue;
+            const msg = d.message;
+            if (!msg || !msg.usage || !msg.usage.cost) continue;
+            const c = msg.usage.cost.total || 0;
+            if (c <= 0) continue;
+            const model = msg.model || 'unknown';
+            if (model.includes('delivery-mirror')) continue;
+            const ts = d.timestamp || '';
+            const day = ts.substring(0, 10);
+            perModel[model] = (perModel[model] || 0) + c;
+            perDay[day] = (perDay[day] || 0) + c;
+            scost += c;
+            total += c;
+          } catch {}
+        }
+        if (scost > 0) perSession[sid] = (perSession[sid] || 0) + scost;
       }
-      if (scost > 0) perSession[sid] = scost;
     }
 
     const now = new Date();
     const todayKey = now.toISOString().substring(0, 10);
     const weekAgo = new Date(now - 7 * 86400000).toISOString().substring(0, 10);
+    const monthAgo = new Date(now - 30 * 86400000).toISOString().substring(0, 10);
     let weekCost = 0;
+    let monthCost = 0;
     for (const [d, c] of Object.entries(perDay)) {
       if (d >= weekAgo) weekCost += c;
+      if (d >= monthAgo) monthCost += c;
     }
+
+    // Build session labels for the top sessions by cost
+    const sidLabels = {};
+    for (const { dir } of agentDirs) {
+      try {
+        const sData = JSON.parse(fs.readFileSync(path.join(dir, 'sessions.json'), 'utf8'));
+        for (const [key, val] of Object.entries(sData)) {
+          if (val.sessionId) sidLabels[val.sessionId] = val.label || key.split(':').slice(2).join(':');
+        }
+      } catch {}
+    }
+
+    const perSessionLabeled = Object.fromEntries(
+      Object.entries(perSession).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([sid, cost]) => {
+        let label = sidLabels[sid] || null;
+        if (!label) {
+          // Search across all agent dirs for the session file
+          for (const { dir } of agentDirs) {
+            try {
+              const jf = path.join(dir, sid + '.jsonl');
+              if (!fs.existsSync(jf)) continue;
+              const lines = fs.readFileSync(jf, 'utf8').split('\n');
+              for (const l of lines) {
+                if (!l.includes('"user"')) continue;
+                try {
+                  const d = JSON.parse(l);
+                  const c = d.message?.content;
+                  const txt = typeof c === 'string' ? c : Array.isArray(c) ? c.find(x => x.type === 'text')?.text || '' : '';
+                  if (txt) {
+                    let t = txt.replace(/\n/g, ' ').trim();
+                    const bgMatch = t.match(/background task "([^"]+)"/i);
+                    if (bgMatch) t = 'Sub: ' + bgMatch[1];
+                    const cronMatch = t.match(/\[cron:([^\]]+)\]/);
+                    if (cronMatch) {
+                      let cronName = cronMatch[1].substring(0, 8);
+                      try {
+                        const cj = JSON.parse(fs.readFileSync(cronFile, 'utf8'));
+                        const job = cj.jobs?.find(j => j.id?.startsWith(cronMatch[1].substring(0, 8)));
+                        if (job?.name) cronName = job.name;
+                      } catch {}
+                      t = 'Cron: ' + cronName;
+                    }
+                    if (t.startsWith('System:')) t = t.substring(7).trim();
+                    t = t.replace(/^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*/, '');
+                    if (t.startsWith('You are running a boot')) t = 'Boot check';
+                    if (t.match(/whatsapp/i)) t = 'WhatsApp session';
+                    const subMatch2 = t.match(/background task "([^"]+)"/i);
+                    if (!bgMatch && subMatch2) t = 'Sub: ' + subMatch2[1];
+                    label = t.substring(0, 35); if (t.length > 35) label += '\u2026';
+                    break;
+                  }
+                } catch {}
+              }
+              if (label) break;
+            } catch {}
+          }
+        }
+        return [sid, { cost, label: label || ('session-' + sid.substring(0, 8)) }];
+      })
+    );
 
     return {
       total: Math.round(total * 100) / 100,
       today: Math.round((perDay[todayKey] || 0) * 100) / 100,
       week: Math.round(weekCost * 100) / 100,
+      month: Math.round(monthCost * 100) / 100,
       perModel,
       perDay: Object.fromEntries(Object.entries(perDay).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 14)),
-      perSession: (() => {
-        let sidLabels = {};
-        try {
-          const sData = JSON.parse(fs.readFileSync(path.join(sessDir, 'sessions.json'), 'utf8'));
-          for (const [key, val] of Object.entries(sData)) {
-            if (val.sessionId) sidLabels[val.sessionId] = val.label || key.split(':').slice(2).join(':');
-          }
-        } catch {}
-        return Object.fromEntries(
-          Object.entries(perSession).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([sid, cost]) => {
-            let label = sidLabels[sid] || null;
-            if (!label) {
-              try {
-                const jf = path.join(sessDir, sid + '.jsonl');
-                if (!fs.existsSync(jf)) {
-                  const del = fs.readdirSync(sessDir).find(f => f.startsWith(sid) && f.includes('.deleted'));
-                  if (del) { }
-                }
-                if (fs.existsSync(jf)) {
-                  const lines = fs.readFileSync(jf, 'utf8').split('\n');
-                  for (const l of lines) {
-                    if (!l.includes('"user"')) continue;
-                    try {
-                      const d = JSON.parse(l);
-                      const c = d.message?.content;
-                      const txt = typeof c === 'string' ? c : Array.isArray(c) ? c.find(x => x.type === 'text')?.text || '' : '';
-                      if (txt) {
-                        let t = txt.replace(/\n/g, ' ').trim();
-                        const bgMatch = t.match(/background task "([^"]+)"/i);
-                        if (bgMatch) t = 'Sub: ' + bgMatch[1];
-                        const cronMatch = t.match(/\[cron:([^\]]+)\]/);
-                        if (cronMatch) {
-                          let cronName = cronMatch[1].substring(0, 8);
-                          try {
-                            const cj = JSON.parse(fs.readFileSync(cronFile, 'utf8'));
-                            const job = cj.jobs?.find(j => j.id?.startsWith(cronMatch[1].substring(0, 8)));
-                            if (job?.name) cronName = job.name;
-                          } catch {}
-                          t = 'Cron: ' + cronName;
-                        }
-                        if (t.startsWith('System:')) t = t.substring(7).trim();
-                        t = t.replace(/^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*/, '');
-                        if (t.startsWith('You are running a boot')) t = 'Boot check';
-                        if (t.match(/whatsapp/i)) t = 'WhatsApp session';
-                        const subMatch2 = t.match(/background task "([^"]+)"/i);
-                        if (!bgMatch && subMatch2) t = 'Sub: ' + subMatch2[1];
-                        label = t.substring(0, 35); if (t.length > 35) label += '…';
-                        break;
-                      }
-                    } catch {}
-                  }
-                }
-              } catch {}
-            }
-            return [sid, { cost, label: label || ('session-' + sid.substring(0, 8)) }];
-          })
-        );
-      })()
+      perSession: perSessionLabeled
     };
-  } catch (e) { return { total: 0, today: 0, week: 0, perModel: {}, perDay: {}, perSession: {} }; }
+  } catch (e) { return { total: 0, today: 0, week: 0, month: 0, perModel: {}, perDay: {}, perSession: {} }; }
 }
 
 let costCache = null;
@@ -567,49 +510,53 @@ function getUsageWindows() {
     const now = Date.now();
     const fiveHoursMs = 5 * 3600000;
     const oneWeekMs = 7 * 86400000;
-    const files = fs.readdirSync(sessDir).filter(f => {
-      if (!f.endsWith('.jsonl')) return false;
-      try { return fs.statSync(path.join(sessDir, f)).mtimeMs > now - oneWeekMs; } catch { return false; }
-    });
+    const agentDirs = getAllSessionDirs();
 
     const perModel5h = {};
     const perModelWeek = {};
     const recentMessages = [];
 
-    for (const file of files) {
-      const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const d = JSON.parse(line);
-          if (d.type !== 'message') continue;
-          const msg = d.message;
-          if (!msg || !msg.usage) continue;
-          const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
-          if (!ts) continue;
-          const model = msg.model || 'unknown';
-          const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
-          const outTok = msg.usage.output || 0;
-          const cost = msg.usage.cost ? msg.usage.cost.total || 0 : 0;
+    for (const { dir } of agentDirs) {
+      const files = fs.readdirSync(dir).filter(f => {
+        if (!f.endsWith('.jsonl')) return false;
+        try { return fs.statSync(path.join(dir, f)).mtimeMs > now - oneWeekMs; } catch { return false; }
+      });
 
-          if (now - ts < fiveHoursMs) {
-            if (!perModel5h[model]) perModel5h[model] = { input: 0, output: 0, cost: 0, calls: 0 };
-            perModel5h[model].input += inTok;
-            perModel5h[model].output += outTok;
-            perModel5h[model].cost += cost;
-            perModel5h[model].calls++;
-          }
-          if (now - ts < oneWeekMs) {
-            if (!perModelWeek[model]) perModelWeek[model] = { input: 0, output: 0, cost: 0, calls: 0 };
-            perModelWeek[model].input += inTok;
-            perModelWeek[model].output += outTok;
-            perModelWeek[model].cost += cost;
-            perModelWeek[model].calls++;
-          }
-          if (now - ts < fiveHoursMs) {
-            recentMessages.push({ ts, model, input: inTok, output: outTok, cost });
-          }
-        } catch {}
+      for (const file of files) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            if (d.type !== 'message') continue;
+            const msg = d.message;
+            if (!msg || !msg.usage) continue;
+            const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
+            if (!ts) continue;
+            const model = msg.model || 'unknown';
+            const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
+            const outTok = msg.usage.output || 0;
+            const cost = msg.usage.cost ? msg.usage.cost.total || 0 : 0;
+
+            if (now - ts < fiveHoursMs) {
+              if (!perModel5h[model]) perModel5h[model] = { input: 0, output: 0, cost: 0, calls: 0 };
+              perModel5h[model].input += inTok;
+              perModel5h[model].output += outTok;
+              perModel5h[model].cost += cost;
+              perModel5h[model].calls++;
+            }
+            if (now - ts < oneWeekMs) {
+              if (!perModelWeek[model]) perModelWeek[model] = { input: 0, output: 0, cost: 0, calls: 0 };
+              perModelWeek[model].input += inTok;
+              perModelWeek[model].output += outTok;
+              perModelWeek[model].cost += cost;
+              perModelWeek[model].calls++;
+            }
+            if (now - ts < fiveHoursMs) {
+              recentMessages.push({ ts, model, input: inTok, output: outTok, cost });
+            }
+          } catch {}
+        }
       }
     }
 
@@ -699,26 +646,29 @@ function getUsageWindows() {
 
 function getRateLimitEvents() {
   try {
-    const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
+    const agentDirs = getAllSessionDirs();
     const events = [];
     const now = Date.now();
     const fiveHoursMs = 5 * 3600000;
 
-    for (const file of files) {
-      const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const d = JSON.parse(line);
-          const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
-          if (now - ts > fiveHoursMs) continue;
-          if (d.type === 'error' || (d.message && d.message.stopReason === 'rate_limit')) {
-            const text = JSON.stringify(d);
-            if (text.includes('rate') || text.includes('overloaded') || text.includes('429') || text.includes('limit')) {
-              events.push({ ts, type: 'rate_limit', detail: text.substring(0, 200) });
+    for (const { dir } of agentDirs) {
+      const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+      for (const file of files) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            const ts = d.timestamp ? new Date(d.timestamp).getTime() : 0;
+            if (now - ts > fiveHoursMs) continue;
+            if (d.type === 'error' || (d.message && d.message.stopReason === 'rate_limit')) {
+              const text = JSON.stringify(d);
+              if (text.includes('rate') || text.includes('overloaded') || text.includes('429') || text.includes('limit')) {
+                events.push({ ts, type: 'rate_limit', detail: text.substring(0, 200) });
+              }
             }
-          }
-        } catch {}
+          } catch {}
+        }
       }
     }
     return events;
@@ -862,30 +812,32 @@ function getSystemStats() {
   }
 }
 
+// --- Live Watcher (multi-agent) ---
 let liveClients = [];
-let liveWatcher = null;
+let _dirWatchers = {};
 const _fileWatchers = {};
 const _fileSizes = {};
 
-function watchSessionFile(file) {
-  const filePath = path.join(sessDir, file);
+function watchSessionFile(dir, file) {
+  const filePath = path.join(dir, file);
+  const watchKey = filePath;
   const sessionKey = file.replace('.jsonl', '');
-  if (_fileWatchers[file]) return;
+  if (_fileWatchers[watchKey]) return;
   try {
-    _fileSizes[file] = fs.statSync(filePath).size;
-  } catch { _fileSizes[file] = 0; }
-  
+    _fileSizes[watchKey] = fs.statSync(filePath).size;
+  } catch { _fileSizes[watchKey] = 0; }
+
   try {
-    _fileWatchers[file] = fs.watch(filePath, (eventType) => {
+    _fileWatchers[watchKey] = fs.watch(filePath, (eventType) => {
       if (eventType !== 'change') return;
       try {
         const stats = fs.statSync(filePath);
-        if (stats.size <= (_fileSizes[file] || 0)) return;
+        if (stats.size <= (_fileSizes[watchKey] || 0)) return;
         const fd = fs.openSync(filePath, 'r');
-        const buffer = Buffer.allocUnsafe(stats.size - (_fileSizes[file] || 0));
-        fs.readSync(fd, buffer, 0, buffer.length, _fileSizes[file] || 0);
+        const buffer = Buffer.allocUnsafe(stats.size - (_fileSizes[watchKey] || 0));
+        fs.readSync(fd, buffer, 0, buffer.length, _fileSizes[watchKey] || 0);
         fs.closeSync(fd);
-        _fileSizes[file] = stats.size;
+        _fileSizes[watchKey] = stats.size;
         buffer.toString('utf8').split('\n').filter(l => l.trim()).forEach(line => {
           try { const data = JSON.parse(line); data._sessionKey = sessionKey; broadcastLiveEvent(data); } catch {}
         });
@@ -895,23 +847,32 @@ function watchSessionFile(file) {
 }
 
 function startLiveWatcher() {
-  if (liveWatcher) return;
-  try {
-    fs.readdirSync(sessDir).filter(f => isSessionFile(f)).forEach(watchSessionFile);
-    liveWatcher = fs.watch(sessDir, (eventType, filename) => {
-      if (filename && isSessionFile(filename) && !_fileWatchers[filename]) {
-        try { if (fs.existsSync(path.join(sessDir, filename))) watchSessionFile(filename); } catch {}
-      }
-    });
-  } catch {}
+  const agentDirs = getAllSessionDirs();
+  for (const { dir } of agentDirs) {
+    if (_dirWatchers[dir]) continue;
+    try {
+      fs.readdirSync(dir).filter(f => isSessionFile(f)).forEach(f => watchSessionFile(dir, f));
+      _dirWatchers[dir] = fs.watch(dir, (eventType, filename) => {
+        if (filename && isSessionFile(filename) && !_fileWatchers[path.join(dir, filename)]) {
+          try { if (fs.existsSync(path.join(dir, filename))) watchSessionFile(dir, filename); } catch {}
+        }
+      });
+    } catch {}
+  }
+}
+
+function stopLiveWatchers() {
+  Object.keys(_dirWatchers).forEach(k => { try { _dirWatchers[k].close(); } catch {} });
+  _dirWatchers = {};
+  Object.keys(_fileWatchers).forEach(k => { try { _fileWatchers[k].close(); } catch {} delete _fileWatchers[k]; });
 }
 
 function broadcastLiveEvent(data) {
   if (liveClients.length === 0) return;
-  
+
   const event = formatLiveEvent(data);
   if (!event) return;
-  
+
   const message = `data: ${JSON.stringify(event)}\n\n`;
   liveClients.forEach(res => {
     try {
@@ -923,32 +884,32 @@ function broadcastLiveEvent(data) {
 function formatLiveEvent(data) {
   const timestamp = data.timestamp || new Date().toISOString();
   const sessionKey = data._sessionKey || data.sessionId || 'unknown';
-  
-  const sessions = getSessionsJson();
-  const session = sessions.find(s => s.sessionId === sessionKey || s.key.includes(sessionKey));
+
+  const allSessions = getSessionsJson();
+  const session = allSessions.find(s => s.sessionId === sessionKey || s.key.includes(sessionKey));
   const label = session ? session.label : sessionKey.substring(0, 8);
-  
+
   if (data.type === 'message') {
     const msg = data.message;
     if (!msg) return null;
-    
+
     const role = msg.role || 'unknown';
     let content = '';
-    
+
     if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === 'text' && block.text) {
           content = block.text.substring(0, 150);
           break;
         } else if (block.type === 'toolCall' || block.type === 'tool_use') {
-          content = `🔧 ${block.name || block.toolName || 'tool'}(${(JSON.stringify(block.arguments || block.input || {})).substring(0, 80)})`;
+          content = `tool: ${block.name || block.toolName || 'tool'}(${(JSON.stringify(block.arguments || block.input || {})).substring(0, 80)})`;
           break;
         } else if (block.type === 'toolResult' || block.type === 'tool_result') {
           const rc = typeof block.content === 'string' ? block.content : JSON.stringify(block.content || '');
-          content = `📋 Result: ${rc.substring(0, 100)}`;
+          content = `Result: ${rc.substring(0, 100)}`;
           break;
         } else if (block.type === 'thinking') {
-          content = `💭 ${(block.thinking || '').substring(0, 100)}`;
+          content = `Thinking: ${(block.thinking || '').substring(0, 100)}`;
           break;
         }
       }
@@ -958,14 +919,14 @@ function formatLiveEvent(data) {
     } else if (typeof msg.content === 'string') {
       content = msg.content.substring(0, 150);
     }
-    
+
     if (!content && msg.type === 'tool_result') {
       const rc = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || '');
-      content = `📋 ${rc.substring(0, 100)}`;
+      content = `Result: ${rc.substring(0, 100)}`;
     }
-    
+
     if (!content) return null;
-    
+
     return {
       timestamp,
       session: label,
@@ -973,10 +934,11 @@ function formatLiveEvent(data) {
       content: content.replace(/\n/g, ' ').trim()
     };
   }
-  
+
   return null;
 }
 
+// --- Cron Jobs ---
 function getCronJobs() {
   try {
     if (!fs.existsSync(cronFile)) return [];
@@ -998,17 +960,21 @@ function getCronJobs() {
       return {
         id: j.id,
         name: j.name || j.id.substring(0, 8),
+        agentId: j.agentId || '',
+        model: j.payload?.model || 'default',
         schedule: humanSchedule,
         enabled: j.enabled !== false,
         lastStatus: j.state?.lastStatus || 'unknown',
         lastRunAt: j.state?.lastRunAtMs || 0,
         nextRunAt: j.state?.nextRunAtMs || 0,
-        lastDuration: j.state?.lastDurationMs || 0
+        lastDuration: j.state?.lastDurationMs || 0,
+        deliveryMode: j.delivery?.mode || 'announce',
       };
     });
   } catch { return []; }
 }
 
+// --- Git Activity ---
 function getGitActivity() {
   try {
     const { execSync } = require('child_process');
@@ -1030,36 +996,45 @@ function getGitActivity() {
   } catch { return []; }
 }
 
+// --- Services Status (with ClaudeRelay) ---
+function getClaudeRelayStatus() {
+  if (IS_CONTAINER) return { active: null, status: 'Unavailable in container mode' };
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('docker ps --filter name=claude-relay --format "{{.Status}}" 2>/dev/null',
+      { encoding: 'utf8', timeout: 3000 }).trim();
+    return { active: out.includes('Up'), status: out || 'Not running' };
+  } catch { return { active: false, status: 'Docker not available' }; }
+}
+
 function getServicesStatus() {
+  if (IS_CONTAINER) {
+    const claudeRelay = getClaudeRelayStatus();
+    return [
+      { name: 'openclaw', active: null, status: 'Unavailable in container mode' },
+      { name: 'agent-dashboard', active: true, status: 'Running (container)' },
+      { name: 'claude-relay', active: claudeRelay.active, status: claudeRelay.status }
+    ];
+  }
   const { execSync } = require('child_process');
-  const services = ['openclaw', 'agent-dashboard', 'tailscaled'];
+  const services = ['openclaw', 'agent-dashboard'];
+
+  let result = [];
 
   if (os.platform() === 'linux') {
-    return services.map(name => {
+    result = services.map(name => {
       try {
         const status = execSync(`systemctl is-active ${name} 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
         return { name, active: status === 'active' };
       } catch { return { name, active: false }; }
     });
-  }
-
-  if (os.platform() === 'darwin') {
+  } else if (os.platform() === 'darwin') {
     const gatewayUrl = process.env.GATEWAY_DASHBOARD_URL || 'http://localhost:18789';
     let agentDashboardActive = false;
     try {
       const code = execSync(`curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 3 "${gatewayUrl}" 2>/dev/null`, { encoding: 'utf8', timeout: 5000 }).trim();
       agentDashboardActive = code.length >= 1 && (code[0] === '2' || code[0] === '3');
     } catch { }
-
-    let tailscaledActive = false;
-    const tailscalePaths = ['/Applications/Tailscale.app/Contents/MacOS/Tailscale', 'tailscale'];
-    for (const t of tailscalePaths) {
-      try {
-        execSync(`${t} status 2>/dev/null`, { encoding: 'utf8', timeout: 3000 });
-        tailscaledActive = true;
-        break;
-      } catch { }
-    }
 
     let listOut = '';
     try {
@@ -1078,16 +1053,22 @@ function getServicesStatus() {
       label === 'openclaw' || label.includes('openclaw')
     );
 
-    return services.map(name => {
+    result = services.map(name => {
       if (name === 'agent-dashboard') return { name, active: agentDashboardActive };
-      if (name === 'tailscaled') return { name, active: tailscaledActive };
       return { name, active: openclawActive };
     });
+  } else {
+    result = services.map(name => ({ name, active: null }));
   }
 
-  return services.map(name => ({ name, active: null }));
+  // Add ClaudeRelay Docker status
+  const claudeRelay = getClaudeRelayStatus();
+  result.push({ name: 'claude-relay', active: claudeRelay.active, status: claudeRelay.status });
+
+  return result;
 }
 
+// --- Memory & Key Files ---
 function getMemoryFiles() {
   const files = [];
   try {
@@ -1184,35 +1165,39 @@ function buildKeyFilesAllowed() {
   return map;
 }
 
+// --- Token & Response Time (multi-agent) ---
 function getTodayTokens() {
   try {
-    const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
+    const agentDirs = getAllSessionDirs();
     const now = new Date();
     const todayStr = now.toISOString().substring(0, 10);
     const perModel = {};
     let totalInput = 0, totalOutput = 0;
 
-    for (const file of files) {
-      const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const d = JSON.parse(line);
-          if (d.type !== 'message') continue;
-          const ts = d.timestamp || '';
-          if (!ts.startsWith(todayStr)) continue;
-          const msg = d.message;
-          if (!msg || !msg.usage) continue;
-          const model = (msg.model || 'unknown').split('/').pop();
-          if (model === 'delivery-mirror') continue;
-          const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
-          const outTok = msg.usage.output || 0;
-          if (!perModel[model]) perModel[model] = { input: 0, output: 0 };
-          perModel[model].input += inTok;
-          perModel[model].output += outTok;
-          totalInput += inTok;
-          totalOutput += outTok;
-        } catch {}
+    for (const { dir } of agentDirs) {
+      const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+      for (const file of files) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            if (d.type !== 'message') continue;
+            const ts = d.timestamp || '';
+            if (!ts.startsWith(todayStr)) continue;
+            const msg = d.message;
+            if (!msg || !msg.usage) continue;
+            const model = (msg.model || 'unknown').split('/').pop();
+            if (model === 'delivery-mirror') continue;
+            const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
+            const outTok = msg.usage.output || 0;
+            if (!perModel[model]) perModel[model] = { input: 0, output: 0 };
+            perModel[model].input += inTok;
+            perModel[model].output += outTok;
+            totalInput += inTok;
+            totalOutput += outTok;
+          } catch {}
+        }
       }
     }
     return { totalInput, totalOutput, perModel };
@@ -1221,31 +1206,34 @@ function getTodayTokens() {
 
 function getAvgResponseTime() {
   try {
-    const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
+    const agentDirs = getAllSessionDirs();
     const now = new Date();
     const todayStr = now.toISOString().substring(0, 10);
     const diffs = [];
 
-    for (const file of files) {
-      const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-      let lastUserTs = null;
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const d = JSON.parse(line);
-          if (d.type !== 'message') continue;
-          const ts = d.timestamp || '';
-          if (!ts.startsWith(todayStr)) continue;
-          const role = d.message?.role;
-          const msgTs = new Date(ts).getTime();
-          if (role === 'user') {
-            lastUserTs = msgTs;
-          } else if (role === 'assistant' && lastUserTs) {
-            const diff = msgTs - lastUserTs;
-            if (diff > 0 && diff < 600000) diffs.push(diff);
-            lastUserTs = null;
-          }
-        } catch {}
+    for (const { dir } of agentDirs) {
+      const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+      for (const file of files) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        let lastUserTs = null;
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            if (d.type !== 'message') continue;
+            const ts = d.timestamp || '';
+            if (!ts.startsWith(todayStr)) continue;
+            const role = d.message?.role;
+            const msgTs = new Date(ts).getTime();
+            if (role === 'user') {
+              lastUserTs = msgTs;
+            } else if (role === 'assistant' && lastUserTs) {
+              const diff = msgTs - lastUserTs;
+              if (diff > 0 && diff < 600000) diffs.push(diff);
+              lastUserTs = null;
+            }
+          } catch {}
+        }
       }
     }
     if (diffs.length === 0) return 0;
@@ -1253,8 +1241,52 @@ function getAvgResponseTime() {
   } catch { return 0; }
 }
 
+// --- Costs by Agent ---
+function getCostsByAgent() {
+  try {
+    const agentDirs = getAllSessionDirs();
+    const now = new Date();
+    const todayKey = now.toISOString().substring(0, 10);
+    const weekAgo = new Date(now - 7 * 86400000).toISOString().substring(0, 10);
+    const result = {};
+
+    for (const { agentId, dir } of agentDirs) {
+      let todayCost = 0, weekCost = 0, totalCost = 0;
+      const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+      for (const file of files) {
+        const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const d = JSON.parse(line);
+            if (d.type !== 'message') continue;
+            const msg = d.message;
+            if (!msg || !msg.usage || !msg.usage.cost) continue;
+            const c = msg.usage.cost.total || 0;
+            if (c <= 0) continue;
+            const model = msg.model || 'unknown';
+            if (model.includes('delivery-mirror')) continue;
+            const ts = d.timestamp || '';
+            const day = ts.substring(0, 10);
+            totalCost += c;
+            if (day === todayKey) todayCost += c;
+            if (day >= weekAgo) weekCost += c;
+          } catch {}
+        }
+      }
+      result[agentId] = {
+        today: Math.round(todayCost * 100) / 100,
+        week: Math.round(weekCost * 100) / 100,
+        total: Math.round(totalCost * 100) / 100,
+      };
+    }
+    return result;
+  } catch { return {}; }
+}
+
+// --- Disk & Health History ---
 function trackDiskHistory(diskPercent) {
-  const histFile = path.join(__dirname, 'disk-history.json');
+  const histFile = path.join(dataDir, 'disk-history.json');
   let history = [];
   try { history = JSON.parse(fs.readFileSync(histFile, 'utf8')); } catch {}
   const now = Date.now();
@@ -1295,6 +1327,37 @@ function saveHealthSnapshot() {
 setInterval(saveHealthSnapshot, 5 * 60 * 1000);
 saveHealthSnapshot();
 
+// Cron history auto-tracking
+let lastCronStates = {};
+function trackCronHistory() {
+  try {
+    const crons = getCronJobs();
+    for (const cr of crons) {
+      const prevStatus = lastCronStates[cr.id];
+      const currentStatus = cr.lastStatus;
+      const currentRunAt = cr.lastRunAt;
+      if (prevStatus && prevStatus.lastRunAt !== currentRunAt && currentRunAt > 0) {
+        // Status changed - record to history
+        let history = {};
+        try { history = JSON.parse(fs.readFileSync(cronHistoryFile, 'utf8')); } catch {}
+        if (!history[cr.id]) history[cr.id] = [];
+        history[cr.id].unshift({
+          timestamp: new Date(currentRunAt).toISOString(),
+          status: currentStatus === 'ok' ? 'ok' : 'error',
+          duration: cr.lastDuration,
+          trigger: 'scheduled'
+        });
+        history[cr.id] = history[cr.id].slice(0, 50);
+        try { fs.writeFileSync(cronHistoryFile, JSON.stringify(history, null, 2)); } catch {}
+      }
+      lastCronStates[cr.id] = { lastStatus: currentStatus, lastRunAt: currentRunAt };
+    }
+  } catch {}
+}
+setInterval(trackCronHistory, 60000);
+trackCronHistory();
+
+// Session cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [token, sess] of sessions.entries()) {
@@ -1306,6 +1369,39 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+// --- Static File Serving (Vite build output) ---
+function serveStatic(req, res) {
+  let filePath = req.url === '/' ? '/index.html' : req.url;
+  // Remove query string
+  filePath = filePath.split('?')[0];
+  const fullPath = path.join(distDir, filePath);
+
+  // Security: prevent path traversal
+  if (!fullPath.startsWith(distDir)) {
+    res.writeHead(403); res.end('Forbidden'); return;
+  }
+
+  try {
+    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+      const ext = path.extname(fullPath).toLowerCase();
+      const mimeTypes = {
+        '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
+        '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg',
+        '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2',
+      };
+      res.writeHead(200, { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' });
+      res.end(fs.readFileSync(fullPath));
+    } else {
+      // SPA fallback
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(fs.readFileSync(path.join(distDir, 'index.html'), 'utf8'));
+    }
+  } catch {
+    res.writeHead(500); res.end('Error');
+  }
+}
+
+// --- HTTP Server ---
 const server = http.createServer((req, res) => {
   if (!httpsEnforcement(req, res)) return;
   setSecurityHeaders(res);
@@ -1325,124 +1421,49 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // --- Auth Endpoints ---
   if (req.url === '/api/auth/status') {
-    const creds = getCredentials();
-    const registered = !!creds;
     const loggedIn = isAuthenticated(req);
     setSameSiteCORS(req, res);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ registered, loggedIn }));
+    res.end(JSON.stringify({ loggedIn }));
     return;
   }
 
-  if (req.url === '/api/auth/register' && req.method === 'POST') {
-    const creds = getCredentials();
-    if (creds) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Already registered' }));
-      return;
-    }
-
+  if (req.url === '/api/auth/telegram' && req.method === 'POST') {
     let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 2048) req.destroy(); });
+    req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
     req.on('end', () => {
       try {
-        const ip = getClientIP(req);
-        const { username, password } = JSON.parse(body);
-        if (!username || !password) {
+        const { initData } = JSON.parse(body);
+        if (!initData) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Username and password required' }));
+          res.end(JSON.stringify({ error: 'initData required' }));
           return;
         }
 
-        const pwdError = validatePassword(password);
-        if (pwdError) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: pwdError }));
+        const user = verifyTelegramInitData(initData);
+        if (!user) {
+          auditLog('telegram_auth_failed', ip, { reason: 'invalid_initdata' });
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid Telegram initData' }));
           return;
         }
 
-        const { hash, salt } = hashPassword(password);
-        const newCreds = { username, passwordHash: hash, salt, iterations: 100000 };
-        saveCredentials(newCreds);
+        const userId = String(user.id || '');
+        if (ALLOWED_TELEGRAM_IDS.size > 0 && !ALLOWED_TELEGRAM_IDS.has(userId)) {
+          auditLog('telegram_auth_denied', ip, { userId, username: user.username });
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'User not authorized' }));
+          return;
+        }
 
-        const sessionToken = createSession(username, ip, false);
-        clearFailedAuth(ip);
-        auditLog('register', ip, { username });
+        const username = user.username || user.first_name || `tg_${userId}`;
+        const sessionToken = createSession(username, ip, true);
+        auditLog('telegram_auth_success', ip, { userId, username });
         setSameSiteCORS(req, res);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, sessionToken }));
-      } catch (e) {
-        console.error('Registration error:', e);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bad request' }));
-      }
-    });
-    return;
-  }
-
-  if (req.url === '/api/auth/login' && req.method === 'POST') {
-    const limitCheck = checkRateLimit(ip);
-    if (limitCheck.softLocked) {
-      auditLog('login_locked', ip, { remainingSeconds: limitCheck.remainingSeconds, hardLocked: limitCheck.blocked });
-      res.writeHead(429, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Too many failed login attempts', lockoutRemaining: limitCheck.remainingSeconds }));
-      return;
-    }
-
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 2048) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { username, password, totpCode, rememberMe } = JSON.parse(body);
-        const creds = getCredentials();
-        if (!creds) {
-          recordFailedAuth(ip);
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No account registered' }));
-          return;
-        }
-
-        if (username !== creds.username) {
-          recordFailedAuth(ip);
-          auditLog('login_failed', ip, { username });
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid username or password' }));
-          return;
-        }
-
-        if (!verifyPassword(password, creds.passwordHash, creds.salt)) {
-          recordFailedAuth(ip);
-          auditLog('login_failed', ip, { username });
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid username or password' }));
-          return;
-        }
-
-        if (MFA_SECRET || creds.mfaSecret) {
-          const secret = creds.mfaSecret || MFA_SECRET;
-          if (!totpCode) {
-            setSameSiteCORS(req, res);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ requiresMfa: true }));
-            return;
-          }
-
-          if (!verifyTOTP(secret, totpCode)) {
-            recordFailedAuth(ip);
-            auditLog('login_mfa_failed', ip, { username });
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid TOTP code' }));
-            return;
-          }
-        }
-
-        const sessionToken = createSession(username, ip, rememberMe);
-        clearFailedAuth(ip);
-        auditLog('login_success', ip, { username });
-        setSameSiteCORS(req, res);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, sessionToken }));
+        res.end(JSON.stringify({ success: true, sessionToken, user: { id: userId, username } }));
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Bad request' }));
@@ -1451,246 +1472,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/api/auth/logout' && req.method === 'POST') {
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.substring(7);
-      sessions.delete(token);
-    }
-    auditLog('logout', ip);
-    setSameSiteCORS(req, res);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true }));
-    return;
-  }
-
-  if (req.url === '/api/auth/reset-password' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 2048) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { recoveryToken, newPassword } = JSON.parse(body);
-        if (!safeCompare(recoveryToken, DASHBOARD_TOKEN)) {
-          recordFailedAuth(ip);
-          auditLog('password_reset_failed', ip);
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid recovery token' }));
-          return;
-        }
-
-        const pwdError = validatePassword(newPassword);
-        if (pwdError) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: pwdError }));
-          return;
-        }
-
-        const creds = getCredentials();
-        if (!creds) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No account registered' }));
-          return;
-        }
-
-        const { hash, salt } = hashPassword(newPassword);
-        creds.passwordHash = hash;
-        creds.salt = salt;
-        saveCredentials(creds);
-
-        sessions.clear();
-
-        clearFailedAuth(ip);
-        auditLog('password_reset_success', ip);
-        setSameSiteCORS(req, res);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bad request' }));
-      }
-    });
-    return;
-  }
-
-  if (req.url === '/api/auth/change-password' && req.method === 'POST') {
-    if (!requireAuth(req, res)) return;
-    setSameSiteCORS(req, res);
-
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 2048) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { currentPassword, newPassword } = JSON.parse(body);
-        const creds = getCredentials();
-        if (!creds) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No account registered' }));
-          return;
-        }
-
-        if (!verifyPassword(currentPassword, creds.passwordHash, creds.salt)) {
-          recordFailedAuth(ip);
-          auditLog('password_change_failed', ip);
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Current password is incorrect' }));
-          return;
-        }
-
-        const pwdError = validatePassword(newPassword);
-        if (pwdError) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: pwdError }));
-          return;
-        }
-
-        const { hash, salt } = hashPassword(newPassword);
-        creds.passwordHash = hash;
-        creds.salt = salt;
-        saveCredentials(creds);
-
-        const authHeader = req.headers.authorization;
-        const currentToken = authHeader ? authHeader.substring(7) : null;
-        for (const [token, sess] of sessions.entries()) {
-          if (token !== currentToken) sessions.delete(token);
-        }
-
-        clearFailedAuth(ip);
-        auditLog('password_change_success', ip);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bad request' }));
-      }
-    });
-    return;
-  }
-
-  if (req.url === '/api/auth/mfa-status') {
-    if (!requireAuth(req, res)) return;
-    setSameSiteCORS(req, res);
-    const creds = getCredentials();
-    const enabled = !!(creds?.mfaSecret || MFA_SECRET);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ enabled }));
-    return;
-  }
-
-  if (req.url === '/api/auth/setup-mfa' && req.method === 'POST') {
-    if (!requireAuth(req, res)) return;
-    setSameSiteCORS(req, res);
-    
-    try {
-      const secret = base32Encode(crypto.randomBytes(20));
-      const otpauth_uri = `otpauth://totp/OpenClaw:Dashboard?secret=${secret}&issuer=OpenClaw&algorithm=SHA1&digits=6&period=30`;
-      pendingMfaSecrets.set(getClientIP(req), { secret, createdAt: Date.now() });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ secret, otpauth_uri }));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  if (req.url === '/api/auth/confirm-mfa' && req.method === 'POST') {
-    if (!requireAuth(req, res)) return;
-    setSameSiteCORS(req, res);
-    
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 1024) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { totpCode } = JSON.parse(body);
-        const ip = getClientIP(req);
-        const pending = pendingMfaSecrets.get(ip);
-        
-        if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-          pendingMfaSecrets.delete(ip);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'MFA setup expired. Please try again.' }));
-          return;
-        }
-        
-        if (!totpCode || !verifyTOTP(pending.secret, totpCode)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid TOTP code. Please try again.' }));
-          return;
-        }
-        
-        const creds = getCredentials();
-        if (creds) {
-          creds.mfaSecret = pending.secret;
-          saveCredentials(creds);
-        }
-        pendingMfaSecrets.delete(ip);
-        auditLog('mfa_setup', ip);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  if (req.url === '/api/auth/disable-mfa' && req.method === 'POST') {
-    if (!requireAuth(req, res)) return;
-    setSameSiteCORS(req, res);
-    
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 1024) req.destroy(); });
-    req.on('end', () => {
-      try {
-        const { totpCode } = JSON.parse(body);
-        
-        const creds = getCredentials();
-        const mfaSecret = creds?.mfaSecret || MFA_SECRET;
-        
-        if (!mfaSecret) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'MFA is not enabled' }));
-          return;
-        }
-        
-        if (!totpCode || !verifyTOTP(mfaSecret, totpCode)) {
-          auditLog('mfa_disable_failed', getClientIP(req));
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid TOTP code' }));
-          return;
-        }
-        
-        if (creds) {
-          delete creds.mfaSecret;
-          saveCredentials(creds);
-        }
-        
-        auditLog('mfa_disabled', getClientIP(req));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Bad request' }));
-      }
-    });
-    return;
-  }
-
-  if (req.url === '/' || req.url === '/index.html') {
-    try {
-      const html = fs.readFileSync(htmlPath, 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(html);
-    } catch (e) {
-      res.writeHead(500);
-      res.end('Error loading dashboard');
-    }
-    return;
-  }
-
+  // --- Protected API Endpoints ---
   if (req.url.startsWith('/api/')) {
-    if (!requireAuth(req, res)) return;
+    // Dev mode: skip auth when DASHBOARD_DEV=true and request is from localhost
+    const devMode = process.env.DASHBOARD_DEV === 'true' && isLocalhost(ip);
+    // IP direct access: skip auth for localhost and private IP connections
+    const host = (req.headers.host || '').split(':')[0];
+    const isIPAddress = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host === 'localhost';
+    if (!devMode && !isIPAddress && !requireAuth(req, res)) return;
     setSameSiteCORS(req, res);
 
     if (req.url === '/api/sessions') {
@@ -1718,6 +1507,17 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify(costCache));
       return;
     }
+    if (req.url === '/api/costs-by-agent') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      const costsByAgent = getCostsByAgent();
+      // Convert object to array for frontend
+      const result = Object.entries(costsByAgent).map(([agentId, data]) => ({
+        agentId,
+        ...data
+      }));
+      res.end(JSON.stringify(result));
+      return;
+    }
     if (req.url === '/api/system') {
       const stats = getSystemStats();
       if (stats.disk) stats.diskHistory = trackDiskHistory(stats.disk.percent || 0);
@@ -1730,37 +1530,43 @@ const server = http.createServer((req, res) => {
       const rawId = params.get('id') || '';
       const sessionId = rawId.replace(/[^a-zA-Z0-9\-_:.]/g, '');
       const messages = [];
+      const agentDirs = getAllSessionDirs();
       try {
-        const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
-        let targetFile = files.find(f => f.includes(sessionId));
-        if (!targetFile) {
-          const sFile = path.join(sessDir, 'sessions.json');
-          const data = JSON.parse(fs.readFileSync(sFile, 'utf8'));
-          for (const [k, v] of Object.entries(data)) {
-            if (k === sessionId && v.sessionId) {
-              targetFile = files.find(f => f.includes(v.sessionId));
-              break;
-            }
-          }
-        }
-        if (targetFile) {
-          const lines = fs.readFileSync(path.join(sessDir, targetFile), 'utf8').split('\n').filter(l => l.trim());
-          for (let i = Math.max(0, lines.length - 30); i < lines.length; i++) {
+        for (const { dir } of agentDirs) {
+          const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+          let targetFile = files.find(f => f.includes(sessionId));
+          if (!targetFile) {
+            const sFile = path.join(dir, 'sessions.json');
             try {
-              const d = JSON.parse(lines[i]);
-              if (d.type !== 'message') continue;
-              const msg = d.message;
-              if (!msg) continue;
-              let text = '';
-              if (typeof msg.content === 'string') text = msg.content;
-              else if (Array.isArray(msg.content)) {
-                for (const b of msg.content) {
-                  if (b.type === 'text' && b.text) { text = b.text; break; }
-                  if (b.type === 'tool_use' || b.type === 'toolCall') { text = '🔧 ' + (b.name || b.toolName || 'tool'); break; }
+              const data = JSON.parse(fs.readFileSync(sFile, 'utf8'));
+              for (const [k, v] of Object.entries(data)) {
+                if (k === sessionId && v.sessionId) {
+                  targetFile = files.find(f => f.includes(v.sessionId));
+                  break;
                 }
               }
-              if (text) messages.push({ role: msg.role || 'unknown', content: text.substring(0, 300), timestamp: d.timestamp || '' });
             } catch {}
+          }
+          if (targetFile) {
+            const lines = fs.readFileSync(path.join(dir, targetFile), 'utf8').split('\n').filter(l => l.trim());
+            for (let i = Math.max(0, lines.length - 30); i < lines.length; i++) {
+              try {
+                const d = JSON.parse(lines[i]);
+                if (d.type !== 'message') continue;
+                const msg = d.message;
+                if (!msg) continue;
+                let text = '';
+                if (typeof msg.content === 'string') text = msg.content;
+                else if (Array.isArray(msg.content)) {
+                  for (const b of msg.content) {
+                    if (b.type === 'text' && b.text) { text = b.text; break; }
+                    if (b.type === 'tool_use' || b.type === 'toolCall') { text = 'tool: ' + (b.name || b.toolName || 'tool'); break; }
+                  }
+                }
+                if (text) messages.push({ role: msg.role || 'unknown', content: text.substring(0, 300), timestamp: d.timestamp || '' });
+              } catch {}
+            }
+            break; // reason: found the session file, no need to search other agent dirs
           }
         }
       } catch {}
@@ -1846,7 +1652,7 @@ const server = http.createServer((req, res) => {
     if (req.url.startsWith('/api/logs?')) {
       try {
         const params = new URL(req.url, 'http://localhost').searchParams;
-        const allowedServices = ['openclaw', 'agent-dashboard', 'tailscaled', 'sshd', 'nginx'];
+        const allowedServices = ['openclaw', 'agent-dashboard', 'sshd', 'nginx'];
         const service = params.get('service') || 'openclaw';
         if (!allowedServices.includes(service)) {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -1869,133 +1675,6 @@ const server = http.createServer((req, res) => {
       }
       return;
     }
-    if (req.url === '/api/action/restart-openclaw' && req.method === 'POST') {
-      try {
-        auditLog('action_restart_openclaw', ip);
-        exec('systemctl restart openclaw', (err) => {});
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-    if (req.url === '/api/action/restart-dashboard' && req.method === 'POST') {
-      try {
-        auditLog('action_restart_dashboard', ip);
-        setTimeout(() => {
-          exec('systemctl restart agent-dashboard', (err) => {});
-        }, 2000);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, message: 'Restarting in 2 seconds...' }));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-    if (req.url === '/api/action/clear-cache' && req.method === 'POST') {
-      try {
-        costCache = null;
-        usageCache = null;
-        costCacheTime = 0;
-        usageCacheTime = 0;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-    if (req.url === '/api/action/restart-tailscale' && req.method === 'POST') {
-      auditLog('action_restart_tailscale', ip);
-      exec('systemctl restart tailscaled', (err) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: !err, error: err?.message }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/update-openclaw' && req.method === 'POST') {
-      auditLog('action_update_openclaw', ip);
-      exec('npm update -g openclaw', { timeout: 120000 }, (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: !err, output: stdout?.trim(), error: err?.message }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/kill-tmux' && req.method === 'POST') {
-      exec('tmux kill-session -t claude-persistent 2>/dev/null; echo ok', (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/gc' && req.method === 'POST') {
-      const projDir = path.join(WORKSPACE_DIR, 'projects');
-      exec(`if [ -d "${projDir}" ]; then for d in ${projDir}/*/; do cd "$d" && git gc --quiet 2>/dev/null; done; fi; cd ${WORKSPACE_DIR} && git gc --quiet 2>/dev/null; echo ok`, (err) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/check-update' && req.method === 'POST') {
-      exec('npm outdated -g openclaw 2>/dev/null || echo "up to date"', { timeout: 30000 }, (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, output: (stdout || '').trim() || 'All packages up to date' }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/sys-update' && req.method === 'POST') {
-      auditLog('action_sys_update', ip);
-      exec('apt update -qq && apt upgrade -y -qq 2>&1 | tail -5', { timeout: 300000 }, (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: !err, output: (stdout || '').trim(), error: err?.message }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/disk-cleanup' && req.method === 'POST') {
-      exec('apt autoremove -y -qq 2>/dev/null; apt clean 2>/dev/null; journalctl --vacuum-time=7d 2>/dev/null; echo "Cleanup done"', { timeout: 60000 }, (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, output: (stdout || '').trim() }));
-      });
-      return;
-    }
-    if (req.url === '/api/action/restart-claude' && req.method === 'POST') {
-      exec(`tmux kill-session -t claude-persistent 2>/dev/null; sleep 1; tmux new-session -d -s claude-persistent -x 200 -y 60 && tmux send-keys -t claude-persistent "cd ${WORKSPACE_DIR} && claude" Enter && echo "Claude session started"`, { timeout: 20000 }, (err, stdout) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: !err, output: (stdout || '').trim() }));
-      });
-      return;
-    }
-    if (req.url === '/api/tailscale') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      try {
-        const { execSync } = require('child_process');
-        const statusJson = execSync('tailscale status --json 2>/dev/null', { encoding: 'utf8', timeout: 5000 });
-        const status = JSON.parse(statusJson);
-        const self = status.Self || {};
-        const peers = Object.values(status.Peer || {}).filter(p => p.Online).length;
-        let routes = [];
-        try {
-          const serveStatus = execSync('tailscale serve status 2>/dev/null', { encoding: 'utf8', timeout: 3000 });
-          if (serveStatus && !serveStatus.includes('No serve config')) {
-            routes = serveStatus.split('\n').filter(l => l.includes('http')).map(l => l.trim());
-          }
-        } catch {}
-        res.end(JSON.stringify({
-          hostname: self.HostName || 'unknown',
-          ip: self.TailscaleIPs?.[0] || 'unknown',
-          online: self.Online || false,
-          peers,
-          routes
-        }));
-      } catch (e) {
-        res.end(JSON.stringify({ error: 'Tailscale not available', hostname: '--', ip: '--', online: false, peers: 0, routes: [] }));
-      }
-      return;
-    }
     if (req.url === '/api/lifetime-stats') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       try {
@@ -2006,32 +1685,36 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify(global[cacheKey]));
           return;
         }
-        const files = fs.readdirSync(sessDir).filter(f => isSessionFile(f));
-        let totalTokens = 0, totalMessages = 0, totalCost = 0, totalSessions = files.length;
+        const agentDirs = getAllSessionDirs();
+        let totalTokens = 0, totalMessages = 0, totalCost = 0, totalSessions = 0;
         let firstSessionDate = null;
         const activeDays = new Set();
-        for (const file of files) {
-          const lines = fs.readFileSync(path.join(sessDir, file), 'utf8').split('\n');
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const d = JSON.parse(line);
-              if (d.type !== 'message') continue;
-              totalMessages++;
-              const msg = d.message;
-              if (msg?.usage) {
-                const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
-                const outTok = msg.usage.output || 0;
-                totalTokens += inTok + outTok;
-                totalCost += msg.usage.cost?.total || 0;
-              }
-              if (d.timestamp) {
-                const ts = new Date(d.timestamp).getTime();
-                if (!firstSessionDate || ts < firstSessionDate) firstSessionDate = ts;
-                const day = d.timestamp.substring(0, 10);
-                activeDays.add(day);
-              }
-            } catch {}
+        for (const { dir } of agentDirs) {
+          const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+          totalSessions += files.length;
+          for (const file of files) {
+            const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n');
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const d = JSON.parse(line);
+                if (d.type !== 'message') continue;
+                totalMessages++;
+                const msg = d.message;
+                if (msg?.usage) {
+                  const inTok = (msg.usage.input || 0) + (msg.usage.cacheRead || 0) + (msg.usage.cacheWrite || 0);
+                  const outTok = msg.usage.output || 0;
+                  totalTokens += inTok + outTok;
+                  totalCost += msg.usage.cost?.total || 0;
+                }
+                if (d.timestamp) {
+                  const ts = new Date(d.timestamp).getTime();
+                  if (!firstSessionDate || ts < firstSessionDate) firstSessionDate = ts;
+                  const day = d.timestamp.substring(0, 10);
+                  activeDays.add(day);
+                }
+              } catch {}
+            }
           }
         }
         const result = {
@@ -2069,7 +1752,7 @@ const server = http.createServer((req, res) => {
         else if (fname === 'HEARTBEAT.md') fpath = heartbeatPath;
         else if (fname.startsWith('memory/') && !fname.includes('..')) fpath = path.join(WORKSPACE_DIR, fname);
         else throw new Error('Invalid path');
-        
+
         if (fs.existsSync(fpath)) {
           const content = fs.readFileSync(fpath, 'utf8');
           res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -2114,44 +1797,335 @@ const server = http.createServer((req, res) => {
       }
       return;
     }
-    if (req.url === '/api/key-file' && req.method === 'POST') {
-      let body = '';
-      let overflow = false;
-      req.on('data', chunk => {
-        body += chunk;
-        if (body.length > MAX_FILE_BODY) { overflow = true; req.destroy(); }
+    if (req.url === '/api/live' || req.url.startsWith('/api/live?')) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
       });
+
+      liveClients.push(res);
+      startLiveWatcher();
+
+      res.write('data: {"status":"connected"}\n\n');
+
+      try {
+        const cutoff = Date.now() - 3600000;
+        const agentDirs = getAllSessionDirs();
+        const recentEvents = [];
+        for (const { dir } of agentDirs) {
+          const files = fs.readdirSync(dir).filter(f => {
+            if (!f.endsWith('.jsonl')) return false;
+            try { return fs.statSync(path.join(dir, f)).mtimeMs > cutoff; } catch { return false; }
+          });
+          files.forEach(file => {
+            const sessionKey = file.replace('.jsonl', '');
+            const content = fs.readFileSync(path.join(dir, file), 'utf8');
+            const lines = content.split('\n').filter(l => l.trim());
+            lines.slice(-5).forEach(line => {
+              try {
+                const data = JSON.parse(line);
+                data._sessionKey = sessionKey;
+                const event = formatLiveEvent(data);
+                if (event) recentEvents.push(event);
+              } catch {}
+            });
+          });
+        }
+        recentEvents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        recentEvents.slice(0, 20).forEach(event => {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        });
+      } catch {}
+
+      req.on('close', () => {
+        liveClients = liveClients.filter(client => client !== res);
+        if (liveClients.length === 0) {
+          stopLiveWatchers();
+        }
+      });
+
+      return;
+    }
+
+    // --- Cron Toggle API ---
+    if (req.url === '/api/cron-toggle' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
       req.on('end', () => {
-        if (overflow) {
-          res.writeHead(413, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Payload too large (max 1MB)' }));
+        try {
+          const { id, enabled } = JSON.parse(body);
+          if (!id || typeof enabled !== 'boolean') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Bad request: need id and enabled' }));
+            return;
+          }
+          const configPath = path.join(OPENCLAW_DIR, 'openclaw.json');
+          const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+          const crons = config.cron?.jobs || config.cron || [];
+          const job = Array.isArray(crons) ? crons.find(j => j.id === id) : null;
+          if (!job) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Cron job not found' }));
+            return;
+          }
+          auditLog('cron_toggle', getClientIP(req), { id, enabled });
+          job.enabled = enabled;
+          const tmp = configPath + '.tmp.' + Date.now();
+          fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf8');
+          fs.renameSync(tmp, configPath);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, id, enabled }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
+    // --- Memory Browser API ---
+    if (req.url === '/api/agent-memory') {
+      const agents = getAgentList();
+      const result = {};
+      for (const agent of agents) {
+        const memDir = path.join(OPENCLAW_DIR, 'agents', agent.id, 'workspace', 'memory');
+        const entries = [];
+        try {
+          if (fs.existsSync(memDir)) {
+            for (const f of fs.readdirSync(memDir)) {
+              if (!f.endsWith('.md')) continue;
+              const fp = path.join(memDir, f);
+              const stat = fs.statSync(fp);
+              if (!stat.isFile()) continue;
+              entries.push({ name: f, size: stat.size, modified: stat.mtimeMs });
+            }
+          }
+        } catch {}
+        entries.sort((a, b) => b.name.localeCompare(a.name));
+        result[agent.id] = entries;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (req.url.startsWith('/api/agent-memory-file?') && req.method === 'GET') {
+      try {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const agentId = (params.get('agent') || '').replace(/[^a-zA-Z0-9_-]/g, '');
+        const fileName = (params.get('file') || '').replace(/[^a-zA-Z0-9._-]/g, '');
+        if (!agentId || !fileName || !fileName.endsWith('.md')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Bad request' }));
           return;
         }
+        const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', 'memory', fileName);
+        if (!fs.existsSync(fpath)) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(fs.readFileSync(fpath, 'utf8'));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // --- Agent Topology API ---
+    if (req.url === '/api/topology') {
+      const agents = getAgentList();
+      const nodes = agents.map(a => ({
+        id: a.id,
+        label: a.label || a.id,
+        model: typeof a.model === 'string' ? a.model : (a.model?.primary || ''),
+        default: a.default || false,
+      }));
+      // Parse recent spawn relationships from session files
+      const edges = [];
+      const seen = new Set();
+      for (const agent of agents) {
+        const sessDir = path.join(OPENCLAW_DIR, 'agents', agent.id, 'sessions');
         try {
-          const { path: name, content } = JSON.parse(body);
-          if (typeof name !== 'string' || typeof content !== 'string') {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid request body' }));
-            return;
+          if (!fs.existsSync(sessDir)) continue;
+          const files = fs.readdirSync(sessDir).filter(f => f.endsWith('.jsonl')).sort().reverse().slice(0, 20);
+          for (const f of files) {
+            try {
+              const lines = fs.readFileSync(path.join(sessDir, f), 'utf8').split('\n').filter(Boolean).slice(-200);
+              for (const line of lines) {
+                try {
+                  const msg = JSON.parse(line);
+                  const content = typeof msg.content === 'string' ? msg.content : '';
+                  // Detect sessions_spawn calls
+                  const spawnMatch = content.match(/sessions_spawn.*?agentId['":\s]+(\w+)/);
+                  if (spawnMatch) {
+                    const target = spawnMatch[1];
+                    const key = `${agent.id}->${target}`;
+                    if (!seen.has(key) && agents.some(a => a.id === target)) {
+                      edges.push({ from: agent.id, to: target, type: 'spawn' });
+                      seen.add(key);
+                    }
+                  }
+                } catch {}
+              }
+            } catch {}
           }
-          if (READ_ONLY_FILES.has(name)) {
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'File is read-only' }));
-            return;
+        } catch {}
+      }
+      // Default: jianguo as hub if no edges found
+      if (edges.length === 0) {
+        const hub = agents.find(a => a.default) || agents[0];
+        if (hub) {
+          for (const a of agents) {
+            if (a.id !== hub.id) edges.push({ from: hub.id, to: a.id, type: 'dispatch' });
           }
-          const allowed = buildKeyFilesAllowed();
-          if (!allowed[name]) {
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Forbidden' }));
-            return;
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ nodes, edges }));
+      return;
+    }
+
+    // --- Skills API ---
+    if (req.url === '/api/skills') {
+      const globalSkillsDir = path.join(OPENCLAW_DIR, 'skills');
+      const npmSkillsDir = path.join(os.homedir(), '.nvm/versions/node/v24.13.0/lib/node_modules/openclaw/skills');
+      const globalSkills = [];
+      
+      // Read user-installed skills
+      try {
+        if (fs.existsSync(globalSkillsDir)) {
+          for (const name of fs.readdirSync(globalSkillsDir)) {
+            const skillPath = path.join(globalSkillsDir, name);
+            if (!fs.statSync(skillPath).isDirectory()) continue;
+            let description = '';
+            try {
+              const skillMd = fs.readFileSync(path.join(skillPath, 'SKILL.md'), 'utf8');
+              const descMatch = skillMd.match(/description:\s*["']?(.+?)["']?\s*\n/);
+              if (descMatch) description = descMatch[1].trim();
+            } catch {}
+            globalSkills.push({ name, description, source: 'user' });
           }
-          const fpath = allowed[name];
-          auditLog('file_edit', ip, { file: name });
-          try {
-            if (fs.existsSync(fpath)) {
-              fs.copyFileSync(fpath, fpath + '.bak');
+        }
+      } catch {}
+      
+      // Read built-in skills
+      try {
+        if (fs.existsSync(npmSkillsDir)) {
+          for (const name of fs.readdirSync(npmSkillsDir)) {
+            if (globalSkills.some(s => s.name === name)) continue;
+            const skillPath = path.join(npmSkillsDir, name);
+            if (!fs.statSync(skillPath).isDirectory()) continue;
+            let description = '';
+            try {
+              const skillMd = fs.readFileSync(path.join(skillPath, 'SKILL.md'), 'utf8');
+              const descMatch = skillMd.match(/description:\s*["']?(.+?)["']?\s*\n/);
+              if (descMatch) description = descMatch[1].trim();
+            } catch {}
+            globalSkills.push({ name, description, source: 'builtin' });
+          }
+        }
+      } catch {}
+
+      // Read per-agent skills
+      const agents = getAgentList();
+      const agentSkills = {};
+      for (const agent of agents) {
+        const agentSkillDir = path.join(OPENCLAW_DIR, 'agents', agent.id, 'workspace', 'skills');
+        const skills = [];
+        try {
+          if (fs.existsSync(agentSkillDir)) {
+            for (const name of fs.readdirSync(agentSkillDir)) {
+              const sp = path.join(agentSkillDir, name);
+              if (!fs.statSync(sp).isDirectory()) continue;
+              let description = '';
+              try {
+                const skillMd = fs.readFileSync(path.join(sp, 'SKILL.md'), 'utf8');
+                const descMatch = skillMd.match(/description:\s*["']?(.+?)["']?\s*\n/);
+                if (descMatch) description = descMatch[1].trim();
+              } catch {}
+              skills.push({ name, description });
             }
-          } catch {}
+          }
+        } catch {}
+        if (skills.length > 0) agentSkills[agent.id] = skills;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ global: globalSkills, perAgent: agentSkills }));
+      return;
+    }
+
+    // --- Agent Workspace Files API ---
+    if (req.url === '/api/agent-files') {
+      const agents = getAgentList();
+      const result = {};
+      for (const agent of agents) {
+        const wsDir = path.join(OPENCLAW_DIR, 'agents', agent.id, 'workspace');
+        const files = [];
+        try {
+          for (const f of fs.readdirSync(wsDir)) {
+            if (!f.endsWith('.md')) continue;
+            const fp = path.join(wsDir, f);
+            const stat = fs.statSync(fp);
+            if (!stat.isFile()) continue;
+            files.push({ name: f, size: stat.size, modified: stat.mtimeMs });
+          }
+        } catch {}
+        result[agent.id] = files;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (req.url.startsWith('/api/agent-file?') && req.method === 'GET') {
+      try {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const agentId = (params.get('agent') || '').replace(/[^a-zA-Z0-9_-]/g, '');
+        const fileName = (params.get('file') || '').replace(/[^a-zA-Z0-9._-]/g, '');
+        if (!agentId || !fileName || !fileName.endsWith('.md')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Bad request' }));
+          return;
+        }
+        const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', fileName);
+        if (!fs.existsSync(fpath)) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(fs.readFileSync(fpath, 'utf8'));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    if (req.url === '/api/agent-file' && req.method === 'POST') {
+      let body = '';
+      let overflow = false;
+      req.on('data', chunk => { body += chunk; if (body.length > 1048576) { overflow = true; req.destroy(); } });
+      req.on('end', () => {
+        if (overflow) { res.writeHead(413); res.end('Too large'); return; }
+        try {
+          const { agent, file, content } = JSON.parse(body);
+          const agentId = (agent || '').replace(/[^a-zA-Z0-9_-]/g, '');
+          const fileName = (file || '').replace(/[^a-zA-Z0-9._-]/g, '');
+          if (!agentId || !fileName || !fileName.endsWith('.md') || typeof content !== 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Bad request' }));
+            return;
+          }
+          const fpath = path.join(OPENCLAW_DIR, 'agents', agentId, 'workspace', fileName);
+          auditLog('agent_file_edit', getClientIP(req), { agent: agentId, file: fileName });
+          // Backup
+          try { if (fs.existsSync(fpath)) fs.copyFileSync(fpath, fpath + '.bak'); } catch {}
           const tmp = fpath + '.tmp.' + Date.now();
           fs.writeFileSync(tmp, content, 'utf8');
           fs.renameSync(tmp, fpath);
@@ -2164,96 +2138,195 @@ const server = http.createServer((req, res) => {
       });
       return;
     }
-    if (req.url.startsWith('/api/cron/') && req.method === 'POST') {
-      try {
-        const parts = req.url.split('/');
-        const action = parts[parts.length - 1];
-        const id = parts[parts.length - 2].replace(/[^a-zA-Z0-9\-_]/g, '');
-        if (!id) { res.writeHead(400); res.end('Invalid id'); return; }
-        
-        if (action === 'toggle') {
-          const { execSync } = require('child_process');
-          if (!fs.existsSync(cronFile)) throw new Error('No cron file');
-          const data = JSON.parse(fs.readFileSync(cronFile, 'utf8'));
-          const job = (data.jobs || []).find(j => j.id === id);
-          if (!job) throw new Error('Job not found');
-          job.enabled = !job.enabled;
-          fs.writeFileSync(cronFile, JSON.stringify(data, null, 2));
-          auditLog('cron_toggle', ip, { cronId: id, enabled: job.enabled });
+
+    // --- Run Cron API (Feature 2) ---
+    if (req.url === '/api/run-cron' && req.method === 'POST') {
+      if (IS_CONTAINER) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not available in container mode' }));
+        return;
+      }
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { id } = JSON.parse(body);
+          if (!id) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'id required' }));
+            return;
+          }
+          auditLog('run_cron', getClientIP(req), { id });
+          exec(`openclaw cron run --id "${id.replace(/[^a-zA-Z0-9\-]/g, '')}" 2>&1 || true`, { timeout: 30000 }, (err, stdout) => {
+            // Record to cron history
+            try {
+              let history = {};
+              try { history = JSON.parse(fs.readFileSync(cronHistoryFile, 'utf8')); } catch {}
+              if (!history[id]) history[id] = [];
+              history[id].unshift({
+                timestamp: new Date().toISOString(),
+                status: err ? 'error' : 'ok',
+                trigger: 'manual',
+                output: (stdout || '').substring(0, 200)
+              });
+              history[id] = history[id].slice(0, 50);
+              fs.writeFileSync(cronHistoryFile, JSON.stringify(history, null, 2));
+            } catch {}
+          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, enabled: job.enabled }));
-        } else if (action === 'run') {
-          exec(`openclaw cron run ${id}`, { timeout: 60000 }, (err) => {});
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true }));
-        } else {
-          res.writeHead(404);
-          res.end('Not found');
+          res.end(JSON.stringify({ success: true, message: 'Cron job triggered' }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
         }
+      });
+      return;
+    }
+
+    // --- Trigger Heartbeat API (Feature 2) ---
+    if (req.url === '/api/trigger-heartbeat' && req.method === 'POST') {
+      if (IS_CONTAINER) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not available in container mode' }));
+        return;
+      }
+      auditLog('trigger_heartbeat', getClientIP(req));
+      exec('openclaw system event --type heartbeat --message "Manual heartbeat from dashboard" 2>&1 || true', { timeout: 30000 }, (err, stdout) => {
+        // ignore result, fire-and-forget
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, message: 'Heartbeat triggered' }));
+      return;
+    }
+
+    // --- Budget API (Feature 3) ---
+    if (req.url === '/api/budget' && req.method === 'GET') {
+      try {
+        let budget = { monthly: 100, currency: 'USD' };
+        try { budget = JSON.parse(fs.readFileSync(budgetFile, 'utf8')); } catch {}
+        // Get current month cost
+        const now = new Date();
+        const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        const costData = getCostData();
+        let monthCost = 0;
+        for (const [day, cost] of Object.entries(costData.perDay)) {
+          if (day.startsWith(monthStart)) monthCost += cost;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          monthly: budget.monthly,
+          spent: Math.round(monthCost * 100) / 100,
+          percent: budget.monthly > 0 ? Math.round((monthCost / budget.monthly) * 100) : 0
+        }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
       }
       return;
     }
-    if (req.url === '/api/live' || req.url.startsWith('/api/live?')) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
-      
-      liveClients.push(res);
-      startLiveWatcher();
-      
-      res.write('data: {"status":"connected"}\n\n');
-      
-      try {
-        const cutoff = Date.now() - 3600000;
-        const files = fs.readdirSync(sessDir).filter(f => {
-          if (!f.endsWith('.jsonl')) return false;
-          try { return fs.statSync(path.join(sessDir, f)).mtimeMs > cutoff; } catch { return false; }
-        });
-        const recentEvents = [];
-        files.forEach(file => {
-          const sessionKey = file.replace('.jsonl', '');
-          const content = fs.readFileSync(path.join(sessDir, file), 'utf8');
-          const lines = content.split('\n').filter(l => l.trim());
-          lines.slice(-5).forEach(line => {
-            try {
-              const data = JSON.parse(line);
-              data._sessionKey = sessionKey;
-              const event = formatLiveEvent(data);
-              if (event) recentEvents.push(event);
-            } catch {}
-          });
-        });
-        recentEvents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-        recentEvents.slice(0, 20).forEach(event => {
-          res.write(`data: ${JSON.stringify(event)}\n\n`);
-        });
-      } catch {}
-      
-      req.on('close', () => {
-        liveClients = liveClients.filter(client => client !== res);
-        if (liveClients.length === 0) {
-          if (liveWatcher) { try { liveWatcher.close(); } catch {} liveWatcher = null; }
-          Object.keys(_fileWatchers).forEach(k => { try { _fileWatchers[k].close(); } catch {} delete _fileWatchers[k]; });
+
+    if (req.url === '/api/budget' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { monthly } = JSON.parse(body);
+          if (typeof monthly !== 'number' || monthly < 0) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid monthly budget' }));
+            return;
+          }
+          auditLog('budget_set', getClientIP(req), { monthly });
+          fs.writeFileSync(budgetFile, JSON.stringify({ monthly, updatedAt: Date.now() }));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, monthly }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
         }
       });
-      
       return;
     }
+
+    // --- Session Cleanup API (Feature 4) ---
+    if (req.url === '/api/session-cleanup' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const { sessionKey } = JSON.parse(body);
+          if (!sessionKey) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'sessionKey required' }));
+            return;
+          }
+          auditLog('session_cleanup', getClientIP(req), { sessionKey });
+          // Find and truncate the session transcript file
+          const agentDirs = getAllSessionDirs();
+          let cleaned = false;
+          for (const { dir } of agentDirs) {
+            try {
+              const files = fs.readdirSync(dir).filter(f => isSessionFile(f));
+              for (const file of files) {
+                const sid = extractSessionId(file);
+                if (sid === sessionKey || file.includes(sessionKey)) {
+                  const fpath = path.join(dir, file);
+                  const content = fs.readFileSync(fpath, 'utf8');
+                  const lines = content.split('\n').filter(l => l.trim());
+                  // Keep last 20% of lines (minimum 10)
+                  const keepCount = Math.max(10, Math.floor(lines.length * 0.2));
+                  const kept = lines.slice(-keepCount);
+                  const backupPath = fpath + '.cleanup.' + Date.now();
+                  fs.copyFileSync(fpath, backupPath);
+                  fs.writeFileSync(fpath, kept.join('\n') + '\n');
+                  cleaned = true;
+                  break;
+                }
+              }
+              if (cleaned) break;
+            } catch {}
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: cleaned, message: cleaned ? 'Session transcript cleaned' : 'Session file not found' }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
+    // --- Cron History API (Feature 7) ---
+    if (req.url.startsWith('/api/cron-history')) {
+      try {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const id = params.get('id') || '';
+        let history = {};
+        try { history = JSON.parse(fs.readFileSync(cronHistoryFile, 'utf8')); } catch {}
+
+        // Also try to get data from openclaw cron runs
+        if (id) {
+          const runs = history[id] || [];
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(runs.slice(0, 10)));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(history));
+        }
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([]));
+      }
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
   }
 
-  try {
-    const html = fs.readFileSync(htmlPath, 'utf8');
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(html);
-  } catch (e) {
-    res.writeHead(500);
-    res.end('Error loading dashboard');
-  }
+  // --- Serve static files from dist/ ---
+  serveStatic(req, res);
 });
 
 server.listen(PORT, '0.0.0.0', () => {

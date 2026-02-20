@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+.git
+.gitignore
+.env
+*.md
+*.backup
+*.bak
+disk-history.json

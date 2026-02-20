@@ -3,7 +3,7 @@ node_modules/
 
 # Data files
 data/
-*.json
+disk-history.json
 
 # Logs
 *.log

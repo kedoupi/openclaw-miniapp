@@ -1,0 +1,148 @@
+@import '@telegram-apps/telegram-ui/dist/styles.css';
+@import "tailwindcss";
+
+:root {
+  --bg: #f2f2f7;
+  --card: #ffffff;
+  --card-alt: #f5f5f7;
+  --border: rgba(0,0,0,0.06);
+  --text-1: #1c1c1e;
+  --text-2: #636366;
+  --text-3: #aeaeb2;
+  --blue: #007aff;
+  --green: #34c759;
+  --amber: #ff9500;
+  --red: #ff3b30;
+  --purple: #af52de;
+  --chart-tick: #55556a;
+  --gauge-track: rgba(0,0,0,0.06);
+  --tab-bg: rgba(255,255,255,0.92);
+  --tab-border: rgba(0,0,0,0.1);
+  --skeleton-from: #f0f0f0;
+  --skeleton-mid: #e8e8e8;
+  --tooltip-bg: #fff;
+  --tooltip-border: rgba(0,0,0,0.1);
+  --tooltip-shadow: rgba(0,0,0,0.08);
+  --toggle-off: #e0e0e0;
+  --topo-node-fill: #ffffff;
+  --topo-node-stroke: #d1d1d6;
+  --topo-text: #1c1c1e;
+  --topo-edge: #d1d1d6;
+}
+
+[data-theme="dark"] {
+  --bg: #0c0c0f;
+  --card: #1c1c1e;
+  --card-alt: #2c2c2e;
+  --border: rgba(255,255,255,0.08);
+  --text-1: #f5f5f7;
+  --text-2: #aeaeb2;
+  --text-3: #636366;
+  --blue: #0a84ff;
+  --green: #30d158;
+  --amber: #ff9f0a;
+  --red: #ff453a;
+  --purple: #bf5af2;
+  --chart-tick: #8e8e93;
+  --gauge-track: rgba(255,255,255,0.08);
+  --tab-bg: rgba(28,28,30,0.92);
+  --tab-border: rgba(255,255,255,0.08);
+  --skeleton-from: #2c2c2e;
+  --skeleton-mid: #3a3a3c;
+  --tooltip-bg: #2c2c2e;
+  --tooltip-border: rgba(255,255,255,0.1);
+  --tooltip-shadow: rgba(0,0,0,0.3);
+  --toggle-off: #48484a;
+  --topo-node-fill: #2c2c2e;
+  --topo-node-stroke: #48484a;
+  --topo-text: #f5f5f7;
+  --topo-edge: #48484a;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html { font-size: 14px; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  background: var(--bg); color: var(--text-1);
+  -webkit-font-smoothing: antialiased;
+}
+
+.tgui--platform-ios, .tgui--platform-android, .tgui--platform-base {
+  --tgui--bg_color: var(--bg) !important;
+  --tgui--secondary_bg_color: var(--card) !important;
+}
+
+.c { background: var(--card); border-radius: 12px; box-shadow: 0 0.5px 0 rgba(0,0,0,0.04); }
+.ci { background: var(--card-alt); border-radius: 8px; }
+
+.tab-bar {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
+  background: var(--tab-bg);
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border-top: 0.5px solid var(--tab-border);
+  display: flex; justify-content: space-around;
+  padding: 4px 0 calc(4px + env(safe-area-inset-bottom, 0px));
+}
+.tab-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 4px 0; min-width: 52px; background: none; border: none; cursor: pointer;
+  transition: color 0.15s;
+}
+.tab-btn svg { width: 22px; height: 22px; }
+
+.dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.dot-g { background: var(--green); }
+.dot-r { background: var(--red); }
+
+.av {
+  width: 38px; height: 38px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; flex-shrink: 0; background: var(--card-alt);
+}
+
+.badge {
+  display: inline-flex; align-items: center; padding: 2px 7px;
+  border-radius: 5px; font-size: 11px; font-weight: 500;
+}
+
+.bar-t { height: 4px; background: var(--gauge-track); border-radius: 2px; overflow: hidden; }
+.bar-f { height: 100%; border-radius: 2px; transition: width 0.5s cubic-bezier(0.4,0,0.2,1); }
+
+.page { padding: 4px 16px calc(72px + env(safe-area-inset-bottom, 0px) + 16px); }
+
+.fi { animation: fi 0.25s ease; }
+@keyframes fi { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+.sh {
+  background: linear-gradient(90deg, var(--skeleton-from) 25%, var(--skeleton-mid) 50%, var(--skeleton-from) 75%);
+  background-size: 200% 100%; animation: sh 1.6s ease infinite; border-radius: 10px;
+}
+@keyframes sh { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+::-webkit-scrollbar { width: 0; height: 0; }
+
+.recharts-default-tooltip {
+  background: var(--tooltip-bg) !important; border: 0.5px solid var(--tooltip-border) !important;
+  border-radius: 10px !important; box-shadow: 0 4px 16px var(--tooltip-shadow) !important;
+}
+.recharts-tooltip-label { color: var(--text-3) !important; font-size: 11px !important; }
+.recharts-tooltip-item { color: var(--text-1) !important; font-size: 12px !important; }
+
+/* Pull to refresh */
+.ptr-indicator {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  display: flex; justify-content: center; align-items: center;
+  height: 0; overflow: hidden; transition: height 0.2s ease;
+  background: var(--bg); color: var(--text-3); font-size: 12px;
+}
+.ptr-indicator.active { height: 50px; }
+.ptr-spinner {
+  width: 20px; height: 20px; border: 2px solid var(--border);
+  border-top-color: var(--blue); border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Live feed */
+.live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--red); animation: pulse 2s ease infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }

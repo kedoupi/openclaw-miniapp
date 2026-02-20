@@ -1,0 +1,19 @@
+services:
+  dashboard:
+    build: .
+    container_name: openclaw-dashboard
+    ports:
+      - "8800:8800"
+    volumes:
+      - ~/.openclaw:/openclaw:ro
+      - dashboard-data:/app/data
+    environment:
+      - DASHBOARD_PORT=8800
+      - OPENCLAW_DIR=/openclaw
+      - WORKSPACE_DIR=/openclaw/agents/jianguo/workspace
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - ALLOWED_TELEGRAM_IDS=${ALLOWED_TELEGRAM_IDS:-}
+    restart: unless-stopped
+
+volumes:
+  dashboard-data:
