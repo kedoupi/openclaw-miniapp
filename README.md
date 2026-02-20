@@ -5,6 +5,20 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](Dockerfile)
 
+## Screenshots
+
+| Dashboard | Sessions | Costs |
+|-----------|----------|-------|
+| ![Dashboard](docs/dashboard-desktop.png) | ![Sessions](docs/sessions.png) | ![Costs](docs/costs.png) |
+
+| Crons | System | Live Feed |
+|-------|--------|-----------|
+| ![Crons](docs/crons.png) | ![System](docs/system.png) | ![Live](docs/live.png) |
+
+| Config | Mobile |
+|--------|--------|
+| ![Config](docs/config.png) | <img src="docs/dashboard-mobile.png" width="300" /> |
+
 ## Features
 
 - **📊 Real-time Overview** — Cost tracking, system health gauges, agent status at a glance
@@ -12,11 +26,11 @@
 - **⏰ Cron Management** — View, toggle, and manually trigger scheduled tasks
 - **💰 Cost Analytics** — Breakdown by model, agent, day, and session with budget tracking
 - **⚡ Live Feed** — SSE-powered real-time stream of all agent activity
-- **🖥️ System Health** — CPU, RAM, disk monitoring with history sparklines
+- **🖥️ System Health** — CPU, RAM, disk monitoring with 24h history chart
 - **🔧 Config Editor** — Edit workspace files (AGENTS.md, SOUL.md, MEMORY.md, etc.) from browser
-- **🤖 Multi-Agent** — Full support for multi-agent setups with per-agent cost breakdown
+- **🤖 Multi-Agent** — Full support for multi-agent setups with per-agent cost breakdown and topology view
 - **🌗 Dark Mode** — Auto-detects system/Telegram theme preference
-- **📱 Responsive** — Mobile-first with Telegram Mini App support + desktop sidebar layout
+- **📱 Responsive** — Mobile-first Telegram Mini App + desktop sidebar layout
 
 ## Quick Start
 
@@ -70,8 +84,9 @@ services:
     ports:
       - "8800:8800"
     volumes:
-      - ~/.openclaw:/openclaw:ro    # Read-only access to OpenClaw data
-      - dashboard-data:/app/data    # Persistent dashboard data
+      - ~/.openclaw:/openclaw:ro
+      - ~/.openclaw/agents:/openclaw/agents:rw
+      - dashboard-data:/app/data
     environment:
       - DASHBOARD_PORT=8800
       - OPENCLAW_DIR=/openclaw
@@ -116,10 +131,10 @@ Two access modes:
 │  Browser (IP)    │     │  - cron/jobs.json│
 └─────────────────┘     │  - workspace/    │
                         └──────────────────┘
-                               │ :ro
+                               │ volume
                         ┌──────────────────┐
                         │  ~/.openclaw/     │
-                        │  (Host volume)    │
+                        │  (Host mount)     │
                         └──────────────────┘
 ```
 
@@ -144,7 +159,7 @@ All `/api/*` endpoints require auth (session token or IP direct access).
 | `GET /api/crons` | Cron job list with status |
 | `POST /api/cron-toggle` | Enable/disable a cron job |
 | `GET /api/topology` | Agent relationship graph |
-| `GET /api/skills` | Global + per-agent skills |
+| `GET /api/skills` | Global + per-agent installed skills |
 | `GET /api/live` | SSE stream of real-time agent messages |
 | `GET /api/health-history` | 24h CPU/RAM history |
 | `GET /api/lifetime-stats` | All-time token/cost/session totals |
@@ -152,25 +167,23 @@ All `/api/*` endpoints require auth (session token or IP direct access).
 
 ## Container Mode
 
-When running in Docker, certain host-dependent features gracefully degrade:
+When running in Docker, host-dependent features gracefully degrade:
 
 | Feature | Container Behavior |
 |---------|-------------------|
 | Run Cron | Returns 503 (no `openclaw` CLI in container) |
 | Trigger Heartbeat | Returns 503 |
 | Service Status | Shows "container mode" |
-| Claude Relay Status | Unavailable (no Docker socket) |
 | Session/Cost/Cron Data | ✅ Works via volume mount |
+| Config/File Editing | ✅ Works (agents dir mounted rw) |
 
 ## Development
 
 ```bash
 npm install --legacy-peer-deps
-npm run dev          # Vite dev server (frontend)
+npm run dev          # Vite dev server with HMR
 node server.js       # API server (separate terminal)
 ```
-
-Frontend hot-reloads at `http://localhost:5173`, API at configured port.
 
 ## Credits
 
