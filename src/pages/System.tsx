@@ -6,7 +6,6 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'rec
 export function System() {
   const { data: sys, refresh } = useApi(api.getSystem);
   const { data: hist } = useApi(api.getHealthHistory);
-  const { data: svcs } = useApi(api.getServices);
   const cd = hist?.map(h => ({
     time: new Date(h.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
     cpu: h.cpu, ram: h.ram,
@@ -52,23 +51,6 @@ export function System() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div style={{ width: 10, height: 3, borderRadius: 2, background: 'var(--blue)' }} /><span style={{ fontSize: 10, color: 'var(--text-3)' }}>CPU</span></div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}><div style={{ width: 10, height: 3, borderRadius: 2, background: 'var(--green)' }} /><span style={{ fontSize: 10, color: 'var(--text-3)' }}>内存</span></div>
           </div>
-        </div>
-      )}
-
-      {svcs && svcs.length > 0 && (
-        <div className="c" style={{ padding: 14 }}>
-          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 10 }}>服务</div>
-          {svcs.map(s => (
-            <div key={s.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0' }}>
-              <span style={{ fontSize: 13 }}>{s.name}</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span className={`dot ${s.active ? 'dot-g' : s.active === false ? 'dot-r' : ''}`} style={s.active === null ? { background: 'var(--text-3)' } : {}} />
-                <span style={{ fontSize: 11, color: s.active ? 'var(--green)' : s.active === false ? 'var(--red)' : 'var(--text-3)' }}>
-                  {s.active ? '运行中' : s.active === false ? '停止' : '未知'}
-                </span>
-              </div>
-            </div>
-          ))}
         </div>
       )}
 

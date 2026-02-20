@@ -767,11 +767,18 @@ function getSystemStats() {
           diskTotal = totalGB + 'G';
         }
       } else {
-        const df = execSync("df / --output=pcent,used,size -B1G | tail -1", { encoding: 'utf8' }).trim();
-        const parts = df.split(/\s+/);
-        diskPercent = parseInt(parts[0], 10) || 0;
-        diskUsed = (parts[1] || '') + 'G';
-        diskTotal = (parts[2] || '') + 'G';
+        // Works on both GNU coreutils and BusyBox (Alpine)
+        const df = execSync("df / | tail -1", { encoding: 'utf8' }).trim();
+        const parts = df.split(/\s+/).filter(Boolean);
+        // Format: Filesystem 1K-blocks Used Available Use% Mounted
+        if (parts.length >= 5) {
+          const totalKB = parseInt(parts[1], 10) || 0;
+          const usedKB = parseInt(parts[2], 10) || 0;
+          const pctStr = parts[4].replace('%', '');
+          diskPercent = parseInt(pctStr, 10) || 0;
+          diskUsed = Math.round(usedKB / 1048576) + 'G';
+          diskTotal = Math.round(totalKB / 1048576) + 'G';
+        }
       }
     } catch {}
 

@@ -6,6 +6,7 @@ services:
       - "8800:8800"
     volumes:
       - ~/.openclaw:/openclaw:ro
+      - ~/.openclaw/agents:/openclaw/agents:rw
       - dashboard-data:/app/data
     environment:
       - DASHBOARD_PORT=8800
